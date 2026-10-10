@@ -864,6 +864,17 @@ Incoming Webhookのみ。**通知は一方向で、承認操作はSlackから行
 | 7 | **Javaの依存ライブラリがスキャンされていなかった** | CIのスキャン結果 | `trivy fs` はロックファイルを見て依存を解決する。Gradleでロックファイルを使っていないと**検出0件**になり、「検出なし」が「脆弱性なし」に見える |
 | 8 | `ecs:DeregisterTaskDefinition` がリソースレベル権限に非対応 | IAMポリシーシミュレータ | ARNを指定するとどのパターンでも `implicitDeny`。`*` で許可し、環境の制限はタグ条件で行う必要がある |
 | 9 | **自分で設定したIAM Denyが自分のアップロードを阻んだ** | CIのレポート格納 | `aws s3 cp` はアップロード時にタグを付けられない。`Kind` タグ必須のDenyにより PutObject が拒否される。「上げてから後でタグを付ける」構成は成立しない |
+| 10 | ECRのタグがIMMUTABLEで同一commitの再pushが失敗 | devへのデプロイ | mainでビルド済みのcommitをdevへデプロイしようとした。**ADR-0005の観点では「同じcommitを作り直さない」のが正しい**ため、既存の成果物のdigestを再利用する形に変更した |
+| 11 | `ecs:TagResource` の権限不足 | devへのデプロイ | `RegisterTaskDefinition` にタグを付けると、ECSは別途 `ecs:TagResource` をタスク定義のARNに対して要求する。タグ付けは `aws:RequestTag/Environment` で環境を縛るために必須なので省略できない |
+
+### 10番は設計の意図に合わせる方向で解決した
+
+ECRのタグをIMMUTABLEにしているのは「同じcommitから別のイメージができる」ことを
+防ぐための設定である。したがって再pushを通すのではなく、
+**既存の成果物があれば作り直さずに再利用する**のが正しい。
+
+結果として「mainでビルド済みのcommitをdevへデプロイするとビルドをスキップする」
+という、ADR-0005にとって望ましい挙動になった。
 
 ### 7番が最も重要
 
@@ -894,13 +905,20 @@ IDを更新して信頼関係を張り直す必要がある。
 ### IAMポリシーシミュレータが有効だった
 
 `aws iam simulate-principal-policy` による事前検証で8番を検出できた。
-同時に「**dev用ロールがprodのstateに書き込めない**」ことも確認でき、
-1アカウント内の環境分離（ADR-0006）が実際に機能していることの裏付けになった。
+同時に、設計が意図した制限が実際に効いていることも確認できた。
 
 ```
 s3:PutObject  .../serviceA/appA/dev/terraform.tfstate   allowed
-s3:PutObject  .../serviceA/appA/prod/terraform.tfstate  implicitDeny
+s3:PutObject  .../serviceA/appA/prod/terraform.tfstate  implicitDeny   <- 環境分離（ADR-0006）
+
+iam:AttachRolePolicy  service-role配下のポリシー        allowed
+iam:AttachRolePolicy  AdministratorAccess               implicitDeny   <- 権限昇格の防止
 ```
+
+**条件キーを与えないと誤って implicitDeny になる点に注意。**
+`iam:PolicyARN` や `iam:PassedToService` を条件に使っている場合、
+`--context-entries` で値を渡さないと条件が満たされず拒否と判定される。
+実際に8番以外の「拒否」はすべてこの理由による誤検出だった。
 
 ### 構造的に予見できた問題
 
