@@ -106,8 +106,22 @@ exceptions:
 | 全体 | 全リソースに `Environment` タグを付ける | IAMのタグ条件とガードレール |
 | ECS | タスク定義の登録時にタグを付ける | `RegisterTaskDefinition` はリソース制限に非対応 |
 | ALB | リスナールールの優先度はSSMの値を使う | 自前採番すると3環境で衝突する（ADR-0013） |
+| Java | **ロックファイルを使うか、コンテナイメージを作るかのどちらかが必要** | `trivy fs` はロックファイルを見て依存を解決する。どちらも無いと**依存ライブラリが1件もスキャンされず、検出0件が「安全」に見える**（実機で発生。設計書15章） |
+| Terraform | SSMパラメータ由来の値をoutputに出す場合は `nonsensitive()` で明示的に解除する | Terraformが自動的にsensitiveとして扱うため、解除しないとplanが失敗する |
 
 詳細は [platform-infra/README.md](../platform-infra/README.md) を参照。
+
+## 基盤側の実装で守る必要がある規約
+
+実機検証で判明したもの（設計書15章）。基盤を改修する人向け。
+
+| 規約 | 理由 |
+|---|---|
+| **OIDCを使うジョブには `permissions: id-token: write` をジョブレベルで書く** | 再利用可能ワークフローのワークフローレベル `permissions` がGITHUB_TOKENの上限になる。無いと「Could not load credentials from any providers」で失敗する |
+| **OIDCの信頼ポリシーはオーナーID・リポジトリIDを含める** | GitHubは不変サブジェクトが既定（`repo:owner@<id>/repo@<id>:environment:<env>`）。名前ベースでは一致しない |
+| **S3へのアップロードは `aws s3api put-object --tagging` を使う** | `aws s3 cp` はタグを付けられず、`Kind` タグ必須のIAM DenyでPutObjectが拒否される。「上げてから後でタグを付ける」構成は成立しない |
+| **composite action内から他のactionを呼ぶときは完全なリポジトリパスで書く** | `./actions/xxx` は呼び出し側リポジトリを参照してしまう |
+| **リソースレベル権限に非対応のAPIはタグ条件で縛る** | `ecs:RegisterTaskDefinition` と `ecs:DeregisterTaskDefinition` はARN指定では一致しない。IAMポリシーシミュレータで事前に確認できる |
 
 ## 必要なGitHub Secrets
 
