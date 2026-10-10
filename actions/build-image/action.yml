@@ -36,6 +36,9 @@ outputs:
   image-uri:
     description: digestで固定したイメージURI
     value: ${{ steps.push.outputs.image-uri }}
+  reused:
+    description: 既存の成果物を再利用したか（true / false）
+    value: ${{ steps.push.outputs.reused }}
 
 runs:
   using: composite
@@ -66,6 +69,32 @@ runs:
 
         image="${REGISTRY}/${REPO}:${TAG}"
         echo "::add-mask::${image}"
+
+        # ADR-0005: 同じcommitの成果物を作り直さない。
+        #
+        # ECRのタグはIMMUTABLEにしているため、同じタグへの再pushは失敗する。
+        # これは「同じcommitから別のイメージができる」ことを防ぐための設定であり、
+        # 既に成果物があるなら作り直さずに再利用するのが正しい。
+        #
+        # 例: mainマージでビルド済みのcommitを、あとからdevへデプロイする場合。
+        existing="$(aws ecr describe-images \
+          --repository-name "${REPO}" \
+          --image-ids "imageTag=${TAG}" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text 2>/dev/null || true)"
+
+        if [[ -n "${existing}" && "${existing}" != "None" ]]; then
+          uri="${REGISTRY}/${REPO}@${existing}"
+          echo "::add-mask::${uri}"
+          {
+            echo "image-digest=${existing}"
+            echo "image-uri=${uri}"
+            echo "reused=true"
+          } >> "${GITHUB_OUTPUT}"
+          echo "既存の成果物を再利用します（ADR-0005: 同じcommitから作り直さない）"
+          echo "成果物のdigest: ${existing}"
+          exit 0
+        fi
 
         args=(build -f "${DOCKERFILE}" -t "${image}")
 
@@ -107,6 +136,7 @@ runs:
         {
           echo "image-digest=${digest}"
           echo "image-uri=${uri}"
+          echo "reused=false"
         } >> "${GITHUB_OUTPUT}"
 
         # digestはアカウントIDを含まないため表示してよい

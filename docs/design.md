@@ -860,6 +860,47 @@ Incoming Webhookのみ。**通知は一方向で、承認操作はSlackから行
 | 3 | 再利用可能ワークフローでOIDCが使えない | CIの初回実行 | ワークフローレベルの `permissions: contents: read` がGITHUB_TOKENの上限になる。OIDCを使うジョブに `id-token: write` をジョブレベルで明示する必要がある |
 | 4 | SpotBugs 6.xでタスクの生成に失敗 | CIのスキャンジョブ | 既定のレポートが登録されていないため `reports.named("xml")` の参照で `SpotBugsReport with name 'xml' not found` |
 | 5 | Spring Boot 4でテストのパッケージが移動 | ビルド | `AutoConfigureMockMvc` が `org.springframework.boot.test.autoconfigure.web.servlet` に存在しない |
+| 6 | **OIDCの sub が不変サブジェクト形式** | CIのAWS認証 | GitHubは `use_immutable_subject: true` が既定で、subに**オーナーIDとリポジトリIDが含まれる**（`repo:owner@70841616/repo@1413353244:environment:ci`）。名前ベースの信頼ポリシーは一切一致しない |
+| 7 | **Javaの依存ライブラリがスキャンされていなかった** | CIのスキャン結果 | `trivy fs` はロックファイルを見て依存を解決する。Gradleでロックファイルを使っていないと**検出0件**になり、「検出なし」が「脆弱性なし」に見える |
+| 8 | `ecs:DeregisterTaskDefinition` がリソースレベル権限に非対応 | IAMポリシーシミュレータ | ARNを指定するとどのパターンでも `implicitDeny`。`*` で許可し、環境の制限はタグ条件で行う必要がある |
+| 9 | **自分で設定したIAM Denyが自分のアップロードを阻んだ** | CIのレポート格納 | `aws s3 cp` はアップロード時にタグを付けられない。`Kind` タグ必須のDenyにより PutObject が拒否される。「上げてから後でタグを付ける」構成は成立しない |
+
+### 7番が最も重要
+
+CIは**成功したまま**「脆弱性0件」を報告し続けていた。ADR-0008で
+「失敗を問題なしとして通さない」（NFR-05）を掲げていたが、
+**「スキャン対象が存在しないこと」は検出できていなかった。**
+
+対策として、CIでコンテナイメージをビルドし（pushはしない）、
+`trivy image` で実際に同梱される依存ライブラリをスキャンする形に変更した。
+
+| | 検出件数 |
+|---|---|
+| 変更前（`trivy fs` のみ） | 0件 |
+| 変更後（`trivy image` 追加） | 22件（CRITICAL 3 / HIGH 13 / MEDIUM 5 / LOW 1） |
+
+さらに、Javaでロックファイルもイメージも無い場合は**明示的に失敗させる**ようにした。
+
+### 6番への対応方針
+
+不変サブジェクトは**リポジトリの改名・削除・再作成に対する耐性**を持たせる仕組みであり、
+セキュリティ上望ましい。そのため回避せず、オーナーIDとリポジトリIDを
+明示する形に変更した。
+
+`repo_id` が未設定（まだGitHub上に作成していない）リポジトリには
+AWSへのアクセスを許可しない。リポジトリを作り直した場合は、
+IDを更新して信頼関係を張り直す必要がある。
+
+### IAMポリシーシミュレータが有効だった
+
+`aws iam simulate-principal-policy` による事前検証で8番を検出できた。
+同時に「**dev用ロールがprodのstateに書き込めない**」ことも確認でき、
+1アカウント内の環境分離（ADR-0006）が実際に機能していることの裏付けになった。
+
+```
+s3:PutObject  .../serviceA/appA/dev/terraform.tfstate   allowed
+s3:PutObject  .../serviceA/appA/prod/terraform.tfstate  implicitDeny
+```
 
 ### 構造的に予見できた問題
 
