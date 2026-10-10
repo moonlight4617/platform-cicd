@@ -382,6 +382,61 @@ def find_unreported_emergencies(service: str, app: str) -> list[dict[str, Any]]:
     ]
 
 
+def cmd_digest_for_plan(args: argparse.Namespace) -> int:
+    """CIのplanに渡すdigestを決める.
+
+    なぜ必要か:
+        アプリ側のTerraformは stage / prod で image_digest を必須にしている
+        （ADR-0005を変数のvalidationで強制）。CIのplanはデプロイではないため
+        digestを持たないが、何も渡さないとvalidationでplanが失敗する。
+
+        また適当な固定値を渡すと、デプロイ済みのdigestと食い違い、
+        planに毎回タスク定義の差分が出る。plan差分の意味が薄れる。
+
+    決め方（上から順に採用）:
+        1. その環境に現在デプロイされている成果物のdigest（差分が出ない）
+        2. 最新の成果物のdigest（まだデプロイされていない環境向け）
+        3. 空（devはvalidationが無いため問題ない）
+    """
+    records = query_app(args.service, args.app)
+
+    digest = ""
+    source = "none"
+
+    for item in records:
+        if (
+            item.get("kind") == "deploy"
+            and item.get("env") == args.env
+            and item.get("result") == "success"
+            and item.get("image_digest")
+        ):
+            digest = str(item["image_digest"])
+            source = f"{args.env} にデプロイ済みの成果物"
+            break
+
+    if not digest:
+        for item in records:
+            if item.get("kind") == "build" and item.get("image_digest"):
+                digest = str(item["image_digest"])
+                source = "最新の成果物（この環境には未デプロイ）"
+                break
+
+    # Lambdaの成果物はzipのハッシュなので、ECSのdigest形式でない場合は渡さない
+    if digest and not digest.startswith("sha256:"):
+        digest = ""
+        source = "形式が合わないため渡さない"
+
+    var_arg = f"-var=image_digest={digest}" if digest else ""
+
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as fh:
+            fh.write(f"image-digest={digest}\n")
+            fh.write(f"var-arg={var_arg}\n")
+
+    sys.stdout.write(f"planに渡すdigest: {digest or '(なし)'} / 根拠: {source}\n")
+    return 0
+
+
 def cmd_unreported(args: argparse.Namespace) -> int:
     """事後報告が未完了の緊急リリースを一覧する（ADR-0011）.
 
@@ -621,6 +676,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--emergency", action="store_true")
     p.add_argument("--summary-out", default="")
     p.set_defaults(func=cmd_precheck)
+
+    p = sub.add_parser("digest-for-plan", help="CIのplanに渡すdigestを決める")
+    common(p)
+    p.add_argument("--env", required=True, choices=["dev", "stage", "prod"])
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT", ""))
+    p.set_defaults(func=cmd_digest_for_plan)
 
     p = sub.add_parser("unreported", help="事後報告が未完了の緊急リリースを一覧する")
     common(p)

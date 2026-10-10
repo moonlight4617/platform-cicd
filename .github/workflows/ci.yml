@@ -204,6 +204,21 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
           mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
 
+      # stage/prod のTerraformは image_digest を必須にしているため（ADR-0005）、
+      # planにもdigestを渡す必要がある。固定のダミー値を使うと
+      # デプロイ済みの値と食い違ってplanに毎回差分が出るため、
+      # 「現在デプロイされている成果物のdigest」を渡す
+      - name: planに渡すdigestの決定
+        id: digest
+        uses: moonlight4617/platform-cicd/actions/plan-digest@v1
+        with:
+          service: ${{ needs.config.outputs.service }}
+          app: ${{ needs.config.outputs.app }}
+          env: ${{ matrix.env }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
       - name: plan
         id: plan
         uses: moonlight4617/platform-cicd/actions/terraform-plan@v1
@@ -218,6 +233,7 @@ jobs:
           # CIロールは読み取り専用のためロックを取得できない
           lock: "false"
           reports-dir: reports/terraform-${{ matrix.env }}
+          extra-args: ${{ steps.digest.outputs.var-arg }}
 
       - name: plan全文をS3へ
         uses: moonlight4617/platform-cicd/actions/upload-reports@v1
