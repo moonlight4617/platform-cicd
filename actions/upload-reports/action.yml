@@ -71,22 +71,29 @@ runs:
         prefix="${SERVICE}/${app_part}/${ENV_NAME}/${COMMIT_SHA}/${GITHUB_RUN_ID}/${KIND}"
         s3_uri="s3://${BUCKET}/${prefix}"
 
-        aws s3 cp "${SOURCE_DIR}" "${s3_uri}/" \
-          --recursive \
-          --only-show-errors \
-          --metadata "run-id=${GITHUB_RUN_ID},repo=${GITHUB_REPOSITORY},ref=${GITHUB_REF}"
-
-        # Kindタグを付与する。--recursive のcpではタグを付けられないため、
-        # アップロード後に個別に付ける。
-        # 未付与だとライフサイクルの対象外になり、レポートが残り続ける
-        while IFS= read -r key; do
-          aws s3api put-object-tagging \
+        # `aws s3 cp` はアップロード時にタグを付けられない。
+        # IAMポリシーは Kind タグのない PutObject をDenyしているため
+        # （ライフサイクルの判定にタグを使うので、未付与を許すと
+        # レポートが無期限に残る）、put-object で1ファイルずつ上げる。
+        #
+        # 「アップロードしてから後でタグを付ける」構成にはできない。
+        # アップロード自体がDenyされるため。
+        count=0
+        while IFS= read -r -d '' file; do
+          rel="${file#"${SOURCE_DIR}"/}"
+          aws s3api put-object \
             --bucket "${BUCKET}" \
-            --key "${key}" \
-            --tagging "TagSet=[{Key=Kind,Value=${KIND}}]" \
+            --key "${prefix}/${rel}" \
+            --body "${file}" \
+            --tagging "Kind=${KIND}" \
+            --metadata "run-id=${GITHUB_RUN_ID},repo=${GITHUB_REPOSITORY}" \
             >/dev/null
-        done < <(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${prefix}/" \
-                   --query 'Contents[].Key' --output text | tr '\t' '\n' | grep -v '^$')
+          count=$((count + 1))
+        done < <(find "${SOURCE_DIR}" -type f -print0)
+
+        if [[ ${count} -eq 0 ]]; then
+          echo "::warning::${SOURCE_DIR} にファイルがありませんでした"
+        fi
 
         # コンソールURLにはバケット名が含まれるのでマスクされる。
         # PRコメントに載せる際は redact.py を通す
@@ -97,4 +104,4 @@ runs:
           echo "console-url=${console_url}"
         } >> "${GITHUB_OUTPUT}"
 
-        echo "レポートをS3へ格納しました（パスはマスク済み）"
+        echo "レポートをS3へ格納しました（${count} ファイル。パスはマスク済み）"
