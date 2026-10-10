@@ -1,0 +1,100 @@
+name: レポートのS3アップロード
+description: >
+  スキャンレポート・terraform planをprivateなS3へ格納する（ADR-0009）。
+  publicリポジトリではActionsのArtifactもログも公開されるため、
+  これらはS3にのみ置く。Artifactには絶対に置かない。
+
+  Kindタグの付与はIAMポリシーで強制されている（未付与はDenyされる）。
+  タグはライフサイクル（レポート400日 / ログ90日）の判定に使う。
+
+inputs:
+  bucket:
+    description: レポート用S3バケット名。GitHub Secretsから渡す
+    required: true
+  source-dir:
+    description: アップロード元のディレクトリ
+    required: true
+  service:
+    description: サービス名
+    required: true
+  app:
+    description: アプリ名。infraリポジトリでは空
+    required: false
+    default: ""
+  env:
+    description: ci / dev / stage / prod
+    required: true
+  commit-sha:
+    description: 対象のcommit SHA。CD側がこのSHAのCI結果を引くために使う
+    required: true
+  kind:
+    description: reports / logs。S3のライフサイクル判定に使う
+    required: false
+    default: reports
+
+outputs:
+  s3-uri:
+    description: アップロード先のS3 URI
+    value: ${{ steps.upload.outputs.s3-uri }}
+  console-url:
+    description: AWSコンソールで開けるURL
+    value: ${{ steps.upload.outputs.console-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: アップロード
+      id: upload
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        ENV_NAME: ${{ inputs.env }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        KIND: ${{ inputs.kind }}
+      run: |
+        set -euo pipefail
+
+        # バケット名も機密として扱う（ADR-0002）
+        echo "::add-mask::${BUCKET}"
+
+        if [[ ! -d "${SOURCE_DIR}" ]]; then
+          echo "::error::${SOURCE_DIR} が存在しません"
+          exit 1
+        fi
+
+        # ADR-0009のキー構造:
+        #   <service>/<app>/<env>/<commit_sha>/<run_id>/<kind>/
+        app_part="${APP:-_}"
+        prefix="${SERVICE}/${app_part}/${ENV_NAME}/${COMMIT_SHA}/${GITHUB_RUN_ID}/${KIND}"
+        s3_uri="s3://${BUCKET}/${prefix}"
+
+        aws s3 cp "${SOURCE_DIR}" "${s3_uri}/" \
+          --recursive \
+          --only-show-errors \
+          --metadata "run-id=${GITHUB_RUN_ID},repo=${GITHUB_REPOSITORY},ref=${GITHUB_REF}"
+
+        # Kindタグを付与する。--recursive のcpではタグを付けられないため、
+        # アップロード後に個別に付ける。
+        # 未付与だとライフサイクルの対象外になり、レポートが残り続ける
+        while IFS= read -r key; do
+          aws s3api put-object-tagging \
+            --bucket "${BUCKET}" \
+            --key "${key}" \
+            --tagging "TagSet=[{Key=Kind,Value=${KIND}}]" \
+            >/dev/null
+        done < <(aws s3api list-objects-v2 --bucket "${BUCKET}" --prefix "${prefix}/" \
+                   --query 'Contents[].Key' --output text | tr '\t' '\n' | grep -v '^$')
+
+        # コンソールURLにはバケット名が含まれるのでマスクされる。
+        # PRコメントに載せる際は redact.py を通す
+        console_url="https://s3.console.aws.amazon.com/s3/buckets/${BUCKET}?prefix=${prefix}/"
+
+        {
+          echo "s3-uri=${s3_uri}"
+          echo "console-url=${console_url}"
+        } >> "${GITHUB_OUTPUT}"
+
+        echo "レポートをS3へ格納しました（パスはマスク済み）"

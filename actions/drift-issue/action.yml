@@ -1,0 +1,108 @@
+name: ドリフトのIssue作成
+description: >
+  ADR-0012: ドリフトを検知したらGitHub Issueを作る。
+
+  Slack通知のみでは流れて消え、対応の記録と担当の割り当てができない。
+  Issueなら「無視すると判断した理由」をクローズ時のコメントとして残せる。
+
+  同一アプリ×環境のIssueが既に開いている場合は、新規作成せず
+  コメントを追加する（毎晩Issueが増えるのを防ぐ）。
+
+  本文にはリソース名と属性値を載せない。plan全文はS3にある（ADR-0002）。
+
+inputs:
+  github-token:
+    required: true
+  name-prefix:
+    description: <service>-<app>
+    required: true
+  env:
+    required: true
+  add:
+    required: false
+    default: "0"
+  change:
+    required: false
+    default: "0"
+  destroy:
+    required: false
+    default: "0"
+  report-uri:
+    description: plan全文のS3 URI
+    required: false
+    default: ""
+
+outputs:
+  issue-url:
+    value: ${{ steps.issue.outputs.issue-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Issueの作成または更新
+      id: issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        NAME_PREFIX: ${{ inputs.name-prefix }}
+        ENV_NAME: ${{ inputs.env }}
+        ADD: ${{ inputs.add }}
+        CHANGE: ${{ inputs.change }}
+        DESTROY: ${{ inputs.destroy }}
+        REPORT_URI: ${{ inputs.report-uri }}
+      run: |
+        set -euo pipefail
+
+        title="[drift] ${NAME_PREFIX} / ${ENV_NAME}"
+        raw="${RUNNER_TEMP}/drift-body.md"
+        body="${RUNNER_TEMP}/drift-body-redacted.md"
+
+        {
+          echo "## ドリフトを検知しました"
+          echo ""
+          echo "| 項目 | 値 |"
+          echo "|---|---|"
+          echo "| アプリ | ${NAME_PREFIX} |"
+          echo "| 環境 | ${ENV_NAME} |"
+          echo "| 追加 | ${ADD} |"
+          echo "| 変更 | ${CHANGE} |"
+          echo "| 削除 | ${DESTROY} |"
+          echo "| 検知 | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+          echo ""
+          echo "### 対応（いずれかを選んでください）"
+          echo ""
+          echo "1. **コードの状態に戻す** — Release ワークフローを実行し、承認ゲートを通してapplyする"
+          echo "2. **実態を正とする** — コードを修正するPRを作る。既存リソースの取り込みが必要な場合は \`import\` ブロックを追加したPRにする（\`terraform import\` の直接実行は記録に残らないため行わない）"
+          echo "3. **意図した差分として無視** — このIssueに理由を記載して閉じる"
+          echo ""
+          if [[ -n "${REPORT_URI}" ]]; then
+            echo "plan全文: \`${REPORT_URI}\`"
+            echo ""
+          fi
+          echo "publicリポジトリのため、リソース名と属性値はここに掲載していません（ADR-0002）。"
+          echo ""
+          echo "<sub>実行: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}</sub>"
+        } > "${raw}"
+
+        # 二重の保険。ARN・アカウントID・バケット名・IPを伏せる
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/redact.py" --in "${raw}" --out "${body}"
+
+        # 同一アプリ×環境のIssueが開いていればコメントを追加する
+        existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" \
+          --state open --label drift --limit 100 \
+          --json number,title \
+          --jq "[.[] | select(.title == \"${title}\")] | first | .number // empty")"
+
+        if [[ -n "${existing}" ]]; then
+          gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body-file "${body}"
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/issues/${existing}"
+          echo "既存のIssue #${existing} にコメントしました"
+        else
+          gh label create drift --repo "${GITHUB_REPOSITORY}" --color D93F0B \
+            --description "Terraformのドリフト" 2>/dev/null || true
+          url="$(gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "${title}" --label drift --body-file "${body}")"
+          echo "Issueを作成しました: ${url}"
+        fi
+
+        echo "issue-url=${url}" >> "${GITHUB_OUTPUT}"

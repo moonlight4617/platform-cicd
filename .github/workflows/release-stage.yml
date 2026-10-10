@@ -1,0 +1,275 @@
+# stage環境へのリリース（ADR-0003, ADR-0004）
+#
+# 承認1段（dev_lead）。昇格チェーンの起点。
+#
+# リリースの契機は手動実行である。「コードが変わった」と「出す判断をした」を
+# 分離するため（ADR-0004）。
+#
+# 呼び出し側（アプリリポジトリ）:
+#
+#   name: Release stage
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         commit_sha:
+#           description: リリース対象のcommit SHA（省略時は現在のmain）
+#           required: false
+#         ticket_ids:
+#           description: 関連チケットID（カンマ区切り）
+#           required: false
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     release:
+#       uses: moonlight4617/platform-cicd/.github/workflows/release-stage.yml@v1
+#       with:
+#         commit_sha: ${{ inputs.commit_sha }}
+#         ticket_ids: ${{ inputs.ticket_ids }}
+#       secrets: inherit
+
+name: stageへのリリース
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        description: リリース対象のcommit SHA。省略時は現在のmainのHEAD
+        type: string
+        required: false
+        default: ""
+      image_digest:
+        description: digestで直接指定する場合
+        type: string
+        required: false
+        default: ""
+      ticket_ids:
+        description: 関連チケットID（カンマ区切り）
+        type: string
+        required: false
+        default: ""
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+    outputs:
+      image-digest:
+        value: ${{ jobs.checks.outputs.image-digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 事前チェックとセキュリティゲート。承認を求める前に実施する。
+  # 承認者に「通らないリリース」を見せないため
+  # ---------------------------------------------------------------------------
+  checks:
+    name: 事前チェックとセキュリティゲート
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      service: ${{ steps.app.outputs.service }}
+      app: ${{ steps.app.outputs.app }}
+      name-prefix: ${{ steps.app.outputs.name-prefix }}
+      terraform-dir: ${{ steps.app.outputs.terraform-dir }}
+      commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+      image-digest: ${{ steps.resolve.outputs.image-digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      # 成果物の記録から対象を解決する。
+      # 記録がない（= mainマージ時にビルドされていない）ものはここで落ちる
+      - id: resolve
+        uses: moonlight4617/platform-cicd/actions/release-resolve@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          commit-sha: ${{ inputs.commit_sha || github.sha }}
+          image-digest: ${{ inputs.image_digest }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 事前チェック
+        uses: moonlight4617/platform-cicd/actions/release-precheck@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: stage
+          image-digest: ${{ steps.resolve.outputs.image-digest }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      # CI結果の参照 + イメージの再スキャン。
+      # CI通過後に公表された脆弱性を検出するため（ADR-0008）
+      - name: セキュリティゲート
+        uses: moonlight4617/platform-cicd/actions/release-scan-gate@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: stage
+          commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+          image-uri: ""
+          reports-bucket: ${{ secrets.REPORTS_BUCKET }}
+
+      - name: 承認待ちの通知
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: info
+          title: "stageリリースの承認待ち: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            commit `${{ steps.resolve.outputs.commit-sha }}` の
+            stage へのリリースが承認待ちです。
+            事前チェックとセキュリティゲートは通過しています。
+          mention-personas: dev_lead
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 承認画面を開く
+
+      - name: 検査結果の通知（停止時）
+        if: failure()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: failure
+          title: "stageリリースが停止: ${{ steps.app.outputs.name-prefix }}"
+          body: 事前チェックまたはセキュリティゲートで停止しました。承認の前段階です。
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く
+
+  # ---------------------------------------------------------------------------
+  # 承認ゲート（1段）
+  #
+  # 判定の正本はGitHub Environmentsの Required reviewers（ADR-0003）。
+  # このジョブは承認を受けるためだけに存在し、処理は記録のみ
+  # ---------------------------------------------------------------------------
+  approve:
+    name: 承認（dev_lead）
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: stage
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_STAGE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 承認の記録
+        uses: moonlight4617/platform-cicd/actions/record-approval@v1
+        with:
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: stage
+          gate: stage
+          persona: dev_lead
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+  # ---------------------------------------------------------------------------
+  # デプロイ
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: stage へデプロイ
+    needs: [checks, approve]
+    runs-on: ubuntu-latest
+    environment: stage
+    concurrency:
+      group: release-stage-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 承認対象のcommitをデプロイする。
+          # 実行中にmainが進んでも影響を受けないようにする
+          ref: ${{ needs.checks.outputs.commit-sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_STAGE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - name: terraform apply
+        uses: moonlight4617/platform-cicd/actions/terraform-apply@v1
+        with:
+          terraform-dir: ${{ needs.checks.outputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+          env: stage
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          tfstate-bucket: ${{ secrets.TFSTATE_BUCKET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          image-digest: ${{ needs.checks.outputs.image-digest }}
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+
+      # ADR-0010: 記録はこのテーブルが昇格判定の正本なので、
+      # 書き込み失敗はジョブの失敗として扱う。
+      # これに失敗するとprodリリースが「stageを通っていない」と判定される
+      - name: リリースの記録
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/release-record@v1
+        with:
+          kind: deploy
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: stage
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          image-digest: ${{ needs.checks.outputs.image-digest }}
+          branch: main
+          result: ${{ job.status == 'success' && 'success' || 'failed' }}
+          ticket-ids: ${{ inputs.ticket_ids }}
+          approvals: >-
+            [{"gate":"stage","persona":"dev_lead","github_user":"${{ github.actor }}"}]
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 通知
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          title: "stage リリース${{ job.status == 'success' && '完了' || '失敗' }}: ${{ needs.checks.outputs.name-prefix }}"
+          body: >-
+            commit `${{ needs.checks.outputs.commit-sha }}` を stage へリリースしました。
+            prod へ進める場合は Release prod を手動実行してください
+            （同一の成果物のみ許可されます）。
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

@@ -1,0 +1,183 @@
+# dev環境へのデプロイ（ADR-0004の補足）
+#
+# devは**開発者が自由にデプロイして動作確認するサンドボックス**であり、
+# 昇格チェーンには含まれない。したがって:
+#   - 承認ゲートなし
+#   - 任意のブランチをデプロイできる
+#   - 後から入れた方が勝つ（それがサンドボックスの当然の挙動）
+#   - ドリフト検知の対象外（ADR-0012の補足）
+#
+# 「devで動いた」ことはprodで動くことの根拠にならない。
+# 根拠になるのはstageでの確認だけである。
+#
+# ただしサンドボックスでも**状態が分からないと調査ができない**ため、
+# デプロイはDynamoDBに記録し、concurrencyでアプリ単位に直列化する。
+#
+# 呼び出し側（アプリリポジトリ）:
+#
+#   name: Deploy dev
+#   on:
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     deploy:
+#       uses: moonlight4617/platform-cicd/.github/workflows/deploy-dev.yml@v1
+#       secrets: inherit
+
+name: devへのデプロイ
+
+on:
+  workflow_call:
+    inputs:
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+      build:
+        description: イメージをビルドし直すか。falseなら既存のdigestを使う
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: dev へデプロイ
+    runs-on: ubuntu-latest
+    environment: dev
+    # 同一アプリへの同時デプロイを直列化する。
+    # 途中で割り込むと中途半端な状態になるため、キャンセルはしない
+    concurrency:
+      group: deploy-dev-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - name: デプロイ内容の表示
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## devへのデプロイ（サンドボックス）"
+            echo ""
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| アプリ | ${{ steps.app.outputs.name-prefix }} |"
+            echo "| ブランチ | \`${GITHUB_REF_NAME}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| 実行者 | ${GITHUB_ACTOR} |"
+            echo ""
+            echo "devはサンドボックスです。他の人の検証を上書きする可能性があります。"
+            echo "ここでの成功はstage/prodへの昇格の根拠になりません（ADR-0004）。"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: ランタイム別のセットアップ（Java）
+        if: steps.app.outputs.runtime == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Gradleのセットアップ
+        if: steps.app.outputs.runtime == 'java'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: ランタイム別のセットアップ（Node）
+        if: steps.app.outputs.runtime == 'typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.ARTIFACTS_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - name: アプリのビルド
+        if: inputs.build
+        shell: bash
+        env:
+          RUNTIME: ${{ steps.app.outputs.runtime }}
+        run: |
+          set -euo pipefail
+          case "${RUNTIME}" in
+            java)
+              if [[ -x ./gradlew ]]; then
+                ./gradlew --no-daemon --console=plain build -x test
+              else
+                gradle --no-daemon --console=plain build -x test
+              fi
+              ;;
+            typescript) npm ci && npm run build --if-present ;;
+            python) : ;;
+          esac
+
+      - name: イメージのビルドとpush
+        id: image
+        if: inputs.build && steps.app.outputs.deploy == 'ecs'
+        uses: moonlight4617/platform-cicd/actions/build-image@v1
+        with:
+          ecr-repository: ${{ steps.app.outputs.ecr-repository }}
+          image-tag: ${{ github.sha }}
+
+      - name: terraform apply
+        uses: moonlight4617/platform-cicd/actions/terraform-apply@v1
+        with:
+          terraform-dir: ${{ steps.app.outputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+          env: dev
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          tfstate-bucket: ${{ secrets.TFSTATE_BUCKET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          image-digest: ${{ steps.image.outputs.image-digest }}
+          commit-sha: ${{ github.sha }}
+
+      # ADR-0010: 書き込み失敗はジョブの失敗として扱う。
+      # devはサンドボックスだが、記録がないと「今devに何が入っているか」が
+      # 分からず調査できない（FR-54）
+      - name: デプロイの記録
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/release-record@v1
+        with:
+          kind: deploy
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: dev
+          commit-sha: ${{ github.sha }}
+          image-digest: ${{ steps.image.outputs.image-digest }}
+          branch: ${{ github.ref_name }}
+          result: ${{ job.status == 'success' && 'success' || 'failed' }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 通知
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          title: "dev へのデプロイ${{ job.status == 'success' && '完了' || '失敗' }}: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            ブランチ `${{ github.ref_name }}` / commit `${{ github.sha }}` を
+            ${{ github.actor }} がdevへデプロイしました。
+            dev はサンドボックスのため、他の検証を上書きしている可能性があります。
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

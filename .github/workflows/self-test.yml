@@ -1,0 +1,60 @@
+# platform-cicd 自身のCI
+#
+# この基盤は全アプリのCI/CDを止める判断を行う。ここが壊れると
+# 全リポジトリのCIが同時に壊れるため、基盤自身にテストを持たせる。
+#
+# ADR-0001でタグ（@v1）参照にしているのは波及を防ぐためだが、
+# タグを進める前にここが通っていることを条件にする。
+
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: スクリプトと設定のテスト
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存の用意
+        run: pip install --quiet --disable-pip-version-check pyyaml
+
+      # ゲートはCI/CDを止める判断を行う。境界をテストで固定する
+      - name: ゲート判定のテスト
+        run: python3 tests/test_gate.py
+
+      # 「stageを通っていない成果物がprodに出ない」ことを固定する（FR-33）
+      - name: リリース記録と事前チェックのテスト
+        run: python3 tests/test_release_store.py
+
+      - name: Pythonスクリプトの構文チェック
+        run: python3 -m compileall -q scripts tests
+
+      # ワークフローのYAMLが壊れるとGitHub側では
+      # 「ワークフローが存在しない」ように見えて原因が分かりにくい
+      - name: YAMLの構文チェック
+        run: python3 tests/check_yaml.py
+
+      - name: 設定ファイルの整合性チェック
+        run: python3 tests/check_config.py
+
+      - name: シェルスクリプトのチェック
+        run: |
+          set -euo pipefail
+          # action.yml 内のシェルは直接検査できないため、scripts配下のみ対象
+          if compgen -G "scripts/*.sh" > /dev/null; then
+            shellcheck scripts/*.sh
+          else
+            echo "scripts配下に .sh はありません"
+          fi

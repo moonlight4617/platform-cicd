@@ -1,0 +1,106 @@
+name: セキュリティゲート判定
+description: >
+  SARIFを集約してゲート判定を行う（ADR-0008）。
+  基準は platform-cicd/config/policy.yaml が正であり、アプリ側では変更できない。
+  抑制のみ .platform/security-exceptions.yaml で宣言でき、理由と有効期限が必須。
+
+inputs:
+  sarif-dir:
+    description: SARIFのディレクトリ
+    required: false
+    default: reports
+  mode:
+    description: pr / dev / stage / prod
+    required: true
+  exceptions-path:
+    description: 抑制ファイルのパス
+    required: false
+    default: .platform/security-exceptions.yaml
+  report-url:
+    description: レポート全文の場所（S3）。要約に載せる
+    required: false
+    default: "(未アップロード)"
+  fail-on-block:
+    description: >
+      停止条件に該当したときにジョブを失敗させるか。
+      falseにすると判定結果だけを出力する（dev環境の警告のみ運用で使う）。
+    required: false
+    default: "true"
+
+outputs:
+  verdict:
+    description: passed / blocked
+    value: ${{ steps.judge.outputs.verdict }}
+  summary-path:
+    description: 要約（Markdown）のパス
+    value: ${{ steps.judge.outputs.summary-path }}
+  summary-json-path:
+    description: 要約（JSON）のパス
+    value: ${{ steps.judge.outputs.summary-json-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: PyYAMLの用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check pyyaml
+
+    - name: 判定
+      id: judge
+      shell: bash
+      env:
+        SARIF_DIR: ${{ inputs.sarif-dir }}
+        MODE: ${{ inputs.mode }}
+        EXCEPTIONS: ${{ inputs.exceptions-path }}
+        REPORT_URL: ${{ inputs.report-url }}
+        FAIL_ON_BLOCK: ${{ inputs.fail-on-block }}
+      run: |
+        set -uo pipefail
+
+        summary_md="${RUNNER_TEMP}/gate-summary.md"
+        summary_json="${RUNNER_TEMP}/gate-summary.json"
+
+        args=(
+          --sarif-dir "${SARIF_DIR}"
+          --policy "${GITHUB_ACTION_PATH}/../../config/policy.yaml"
+          --mode "${MODE}"
+          --summary-md "${summary_md}"
+          --summary-json "${summary_json}"
+          --report-url "${REPORT_URL}"
+        )
+        if [[ -f "${EXCEPTIONS}" ]]; then
+          args+=(--exceptions "${EXCEPTIONS}")
+        fi
+
+        set +e
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/gate.py" "${args[@]}"
+        status=$?
+        set -e
+
+        # 2 は設定不備。これを「停止」と混同すると原因が分からなくなる
+        if [[ ${status} -eq 2 ]]; then
+          echo "::error::ゲートの設定に不備があります（policy.yaml / security-exceptions.yaml を確認してください）"
+          exit 1
+        fi
+
+        verdict="passed"
+        if [[ ${status} -ne 0 ]]; then
+          verdict="blocked"
+        fi
+
+        {
+          echo "verdict=${verdict}"
+          echo "summary-path=${summary_md}"
+          echo "summary-json-path=${summary_json}"
+        } >> "${GITHUB_OUTPUT}"
+
+        # ジョブサマリにも出す。ログを掘らずに結果が見える
+        cat "${summary_md}" >> "${GITHUB_STEP_SUMMARY}"
+
+        if [[ "${verdict}" == "blocked" ]]; then
+          if [[ "${FAIL_ON_BLOCK}" == "true" ]]; then
+            echo "::error::セキュリティゲートで停止しました（モード ${MODE}）。詳細はジョブサマリを参照してください"
+            exit 1
+          fi
+          echo "::warning::セキュリティゲートの停止条件に該当しましたが、モード ${MODE} では警告のみです"
+        fi

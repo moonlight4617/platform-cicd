@@ -1,0 +1,77 @@
+name: 承認イベントの記録
+description: >
+  ADR-0003: 承認判定の正本はGitHub Environmentsであり、ここでは記録のみ行う。
+  正本を2つにすると食い違う状態が必ず発生するため。
+
+  このactionが実行されたこと自体が「そのEnvironmentの承認を通過した」証拠になる。
+  Environmentの承認が得られなければジョブは開始されない。
+
+  監査記録のキーは "<service>#<app>#<env>#run<run_id>" とし、
+  デプロイ記録（run_idを持つ）と突き合わせられるようにしている。
+
+inputs:
+  service:
+    required: true
+  app:
+    required: true
+  env:
+    description: stage / prod
+    required: true
+  gate:
+    description: ゲートの識別子（stage / prod-approval-1 など）
+    required: true
+  persona:
+    description: 承認したペルソナ（dev_lead / qa_po / sre）
+    required: true
+  commit-sha:
+    required: false
+    default: ""
+  releases-table:
+    required: true
+  tickets-table:
+    required: true
+  approval-audit-table:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: boto3の用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check boto3
+
+    - name: 記録
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        ENV_NAME: ${{ inputs.env }}
+        GATE: ${{ inputs.gate }}
+        PERSONA: ${{ inputs.persona }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        RELEASES_TABLE: ${{ inputs.releases-table }}
+        TICKETS_TABLE: ${{ inputs.tickets-table }}
+        APPROVAL_AUDIT_TABLE: ${{ inputs.approval-audit-table }}
+      run: |
+        set -euo pipefail
+
+        release_id="${SERVICE}#${APP}#${ENV_NAME}#run${GITHUB_RUN_ID}"
+
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/release_store.py" record-approval \
+          --release-id "${release_id}" \
+          --gate "${GATE}" \
+          --persona "${PERSONA}" \
+          --github-user "${GITHUB_ACTOR}" \
+          --event approved
+
+        {
+          echo "## 承認: ${GATE}"
+          echo ""
+          echo "| 項目 | 値 |"
+          echo "|---|---|"
+          echo "| 承認者 | ${GITHUB_ACTOR} |"
+          echo "| ペルソナ | ${PERSONA} |"
+          echo "| 対象commit | \`${COMMIT_SHA}\` |"
+          echo ""
+          echo "判定の正本はGitHub Environmentsです（ADR-0003）。"
+        } >> "${GITHUB_STEP_SUMMARY}"

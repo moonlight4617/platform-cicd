@@ -1,0 +1,201 @@
+# Terraformのドリフト検知（ADR-0012）
+#
+# コードとAWSの実態の乖離を検知し、**対応の判断は人間に委ねる。**
+# 自動applyしないのは、「実態が正しくコードが古い」ケースで
+# 正しい状態を破壊してしまうため。特にprodでは障害対応の手動変更を
+# 巻き戻す危険がある。
+#
+# 対象は stage / prod のみ。**devは対象外。**
+# devはサンドボックスであり、状態は常に誰かの作業中コードなので
+# 「正しい状態」が定義されない。比較対象が存在しないため、
+# ドリフト検知が原理的に意味を持たない（ADR-0012の補足）。
+#
+# 呼び出し側（アプリリポジトリ）:
+#
+#   name: Drift detection
+#   on:
+#     schedule:
+#       - cron: "0 18 * * *"   # UTC 18:00 = JST 03:00
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     id-token: write
+#     issues: write
+#   jobs:
+#     drift:
+#       uses: moonlight4617/platform-cicd/.github/workflows/drift-detection.yml@v1
+#       secrets: inherit
+
+name: ドリフト検知
+
+on:
+  workflow_call:
+    inputs:
+      environments:
+        description: 検知対象の環境（カンマ区切り）。devは指定しない
+        type: string
+        required: false
+        default: "stage,prod"
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: ドリフト検知（${{ matrix.env }}）
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # devを含めないことが意図的な設計（ADR-0012の補足）
+        env: [stage, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - name: 対象環境かの確認
+        id: target
+        shell: bash
+        env:
+          ENVIRONMENTS: ${{ inputs.environments }}
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          set -euo pipefail
+          if [[ ",${ENVIRONMENTS}," != *",${ENV_NAME},"* ]]; then
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            echo "${ENV_NAME} は対象外です"
+          else
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        if: steps.target.outputs.skip != 'true'
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      # -refresh-only で「コードの変更」ではなく「実態の乖離」だけを見る。
+      # CIロールは読み取り専用のため -lock=false
+      - name: plan（refresh-only）
+        id: plan
+        if: steps.target.outputs.skip != 'true'
+        uses: moonlight4617/platform-cicd/actions/terraform-plan@v1
+        with:
+          terraform-dir: ${{ steps.app.outputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+          env: ${{ matrix.env }}
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          tfstate-bucket: ${{ secrets.TFSTATE_BUCKET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          lock: "false"
+          refresh-only: "true"
+          reports-dir: reports/drift-${{ matrix.env }}
+
+      - name: plan結果をS3へ
+        if: steps.target.outputs.skip != 'true'
+        uses: moonlight4617/platform-cicd/actions/upload-reports@v1
+        with:
+          bucket: ${{ secrets.REPORTS_BUCKET }}
+          source-dir: reports/drift-${{ matrix.env }}
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: ${{ matrix.env }}
+          commit-sha: ${{ github.sha }}
+          kind: reports
+
+      # ドリフトがあればIssueを作る。
+      # Slack通知のみでは流れて消え、対応の記録と担当の割り当てができない
+      - name: Issueの作成または更新
+        id: issue
+        if: steps.target.outputs.skip != 'true' && steps.plan.outputs.has-changes == 'true'
+        uses: moonlight4617/platform-cicd/actions/drift-issue@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name-prefix: ${{ steps.app.outputs.name-prefix }}
+          env: ${{ matrix.env }}
+          add: ${{ steps.plan.outputs.add }}
+          change: ${{ steps.plan.outputs.change }}
+          destroy: ${{ steps.plan.outputs.destroy }}
+
+      - name: Slack通知
+        if: steps.target.outputs.skip != 'true' && steps.plan.outputs.has-changes == 'true'
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: warning
+          title: "ドリフト検知: ${{ steps.app.outputs.name-prefix }} / ${{ matrix.env }}"
+          body: >-
+            追加 ${{ steps.plan.outputs.add }} /
+            変更 ${{ steps.plan.outputs.change }} /
+            削除 ${{ steps.plan.outputs.destroy }}。
+            対応（apply / コード修正 / 無視）をIssueで判断してください。
+          mention-personas: sre
+          link-url: ${{ steps.issue.outputs.issue-url }}
+          link-text: Issueを開く
+
+  # 未報告の緊急リリースを催促する（ADR-0011）。
+  # ブロックが主たる抑止力だが、気づかないまま放置されるのを防ぐ
+  remind-postmortem:
+    name: 事後報告の催促
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 未報告の確認
+        id: check
+        uses: moonlight4617/platform-cicd/actions/postmortem-check@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 催促の通知
+        if: steps.check.outputs.unreported == 'true'
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: warning
+          title: "事後報告が未完了です: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            緊急リリースの事後報告が ${{ steps.check.outputs.count }} 件
+            登録されていません。
+            *このアプリの通常prodリリースはブロックされています。*
+            scripts/release_store.py postmortem で登録してください。
+          mention-personas: sre
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

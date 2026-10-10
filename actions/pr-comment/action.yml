@@ -1,0 +1,71 @@
+name: PRへの要約コメント
+description: >
+  ゲート判定の要約とterraform planの要約をPRにコメントする（ADR-0009）。
+
+  publicリポジトリなので、plan全文やSARIFの詳細は載せない。
+  件数・判定結果・S3へのリンクのみ。投稿前に redact.py を通して
+  ARN・アカウントID・バケット名・IPを伏せる（ADR-0002の二重の保険）。
+
+  同じPRに何度もコメントが積まれないよう、既存コメントを更新する。
+
+inputs:
+  body-file:
+    description: コメント本文のファイル（Markdown）
+    required: true
+  marker:
+    description: コメントを識別するための印。同じ印のコメントを更新する
+    required: false
+    default: platform-cicd-report
+  github-token:
+    description: GITHUB_TOKEN
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 伏せ字処理と投稿
+      shell: bash
+      env:
+        BODY_FILE: ${{ inputs.body-file }}
+        MARKER: ${{ inputs.marker }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+          echo "PRイベントではないためコメントをスキップします"
+          exit 0
+        fi
+
+        if [[ ! -f "${BODY_FILE}" ]]; then
+          echo "::error::${BODY_FILE} がありません"
+          exit 1
+        fi
+
+        redacted="${RUNNER_TEMP}/comment-redacted.md"
+
+        # 二重の保険。マスク漏れがあってもPRコメントには載らない
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/redact.py" \
+          --in "${BODY_FILE}" --out "${redacted}"
+
+        # 識別用の印を埋め込む（HTMLコメントなので表示されない）
+        {
+          echo "<!-- ${MARKER} -->"
+          cat "${redacted}"
+        } > "${RUNNER_TEMP}/comment-final.md"
+
+        pr_number="$(python3 -c "import json,os; print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['pull_request']['number'])")"
+
+        # 既存コメントを探して更新する。なければ新規作成
+        existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
+          --paginate --jq "[.[] | select(.body | contains(\"<!-- ${MARKER} -->\"))] | last | .id // empty")"
+
+        if [[ -n "${existing}" ]]; then
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+            -F "body=@${RUNNER_TEMP}/comment-final.md" >/dev/null
+          echo "既存のコメント（id=${existing}）を更新しました"
+        else
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
+            -F "body=@${RUNNER_TEMP}/comment-final.md" >/dev/null
+          echo "コメントを新規作成しました"
+        fi

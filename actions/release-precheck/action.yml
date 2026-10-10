@@ -1,0 +1,76 @@
+name: リリースの事前チェック
+description: >
+  FR-33: stageを経由していない成果物をprodへ出せないことを検証する。
+
+  検証項目:
+    1. 指定されたdigestがmain由来の成果物であること
+    2. prodの場合、同一digestがstageで成功していること
+       （devは昇格チェーン外なので、devでの成功は根拠にならない。ADR-0004）
+    3. 未報告の緊急リリースがないこと（ADR-0011）
+
+  1つでも満たさなければジョブを失敗させる。
+
+inputs:
+  service:
+    required: true
+  app:
+    required: true
+  env:
+    description: stage / prod
+    required: true
+  image-digest:
+    required: true
+  emergency:
+    description: 緊急リリース経路か。trueの場合は未報告チェックを行わない
+    required: false
+    default: "false"
+  releases-table:
+    required: true
+  tickets-table:
+    required: true
+  approval-audit-table:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: boto3の用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check boto3
+
+    - name: 事前チェック
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        ENV_NAME: ${{ inputs.env }}
+        IMAGE_DIGEST: ${{ inputs.image-digest }}
+        EMERGENCY: ${{ inputs.emergency }}
+        RELEASES_TABLE: ${{ inputs.releases-table }}
+        TICKETS_TABLE: ${{ inputs.tickets-table }}
+        APPROVAL_AUDIT_TABLE: ${{ inputs.approval-audit-table }}
+      run: |
+        set -euo pipefail
+
+        args=(
+          precheck
+          --service "${SERVICE}"
+          --app "${APP}"
+          --env "${ENV_NAME}"
+          --image-digest "${IMAGE_DIGEST}"
+          --summary-out "${RUNNER_TEMP}/precheck.md"
+        )
+        if [[ "${EMERGENCY}" == "true" ]]; then
+          args+=(--emergency)
+        fi
+
+        set +e
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/release_store.py" "${args[@]}"
+        status=$?
+        set -e
+
+        if [[ -f "${RUNNER_TEMP}/precheck.md" ]]; then
+          cat "${RUNNER_TEMP}/precheck.md" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+
+        exit ${status}

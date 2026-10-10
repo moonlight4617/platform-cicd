@@ -1,0 +1,131 @@
+# CI/CDの実行ログをS3へ格納する（ADR-0009）
+#
+# なぜ別ワークフローなのか:
+#   GitHub Actionsの実行ログは、実行中のジョブからは取得できない。
+#   ジョブが完了するまでログが確定しないため、同一の実行内で
+#   ログ全体をS3へ上げることは仕様上できない。
+#   そのため workflow_run（completed）を契機に、APIからログのzipを取得する。
+#
+# 呼び出し側（アプリリポジトリ）の .github/workflows/collect-logs.yml:
+#
+#   name: Collect logs
+#   on:
+#     workflow_run:
+#       workflows: [CI, Deploy, Release]
+#       types: [completed]
+#   permissions:
+#     actions: read
+#     contents: read
+#     id-token: write
+#   jobs:
+#     collect:
+#       uses: moonlight4617/platform-cicd/.github/workflows/collect-logs.yml@v1
+#       secrets: inherit
+
+name: 実行ログのS3格納
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: ログの格納先の環境名。既定は ci
+        type: string
+        required: false
+        default: ci
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: ログを取得してS3へ
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      # セキュリティ上の注意:
+      #   workflow_run は特権的なコンテキストで動く（シークレットにアクセスできる）。
+      #   フォークからのPRのcommitをチェックアウトすると、信頼できないコードを
+      #   特権コンテキストで扱うことになる。
+      #   app.yaml を読むだけなので、デフォルトブランチをチェックアウトする。
+      #   head_sha はS3のキーとしてのみ使う。
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.REPORTS_BUCKET }}
+
+      - name: ログのzipを取得
+        id: download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+        run: |
+          set -euo pipefail
+
+          dir="${RUNNER_TEMP}/logs"
+          mkdir -p "${dir}"
+
+          # 対象の実行が属するワークフロー名をファイル名に残す。
+          # 1つのS3プレフィックスに複数ワークフローのログが入るため
+          safe_name="$(echo "${WORKFLOW_NAME}" | tr -c '[:alnum:]._-' '-')"
+          out="${dir}/${safe_name}-run${RUN_ID}-attempt${RUN_ATTEMPT}.zip"
+
+          # ログは実行完了後しばらく生成されないことがある。数回リトライする
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/logs" > "${out}" 2>/dev/null; then
+              if [[ -s "${out}" ]]; then
+                echo "ログを取得しました（${attempt}回目）"
+                break
+              fi
+            fi
+            if [[ ${attempt} -eq 5 ]]; then
+              # ADR-0009の未解決事項: ログ収集の失敗はCI本体の成否と分離している。
+              # 失敗を黙って通すとログ欠落に気づけないため、ここは失敗させる
+              echo "::error::実行ログの取得に失敗しました（run_id=${RUN_ID}）"
+              exit 1
+            fi
+            echo "ログがまだ生成されていません。待機します（${attempt}回目）"
+            sleep $((attempt * 10))
+          done
+
+          echo "size=$(stat -c%s "${out}") bytes"
+          echo "dir=${dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: S3へ格納
+        uses: moonlight4617/platform-cicd/actions/upload-reports@v1
+        with:
+          bucket: ${{ secrets.REPORTS_BUCKET }}
+          source-dir: ${{ steps.download.outputs.dir }}
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: ${{ inputs.env }}
+          commit-sha: ${{ github.event.workflow_run.head_sha }}
+          # Kind=logs にすることでライフサイクルが90日になる（ADR-0009）
+          kind: logs
+
+      - name: 失敗時のSlack通知
+        if: failure()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: warning
+          title: "実行ログのS3格納に失敗: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            CI/CD本体は完了していますが、ログの保存に失敗しました。
+            ログが欠落している可能性があります（ADR-0009）。
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

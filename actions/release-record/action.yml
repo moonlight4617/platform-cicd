@@ -1,0 +1,137 @@
+name: リリース記録
+description: >
+  ADR-0010: リリース履歴をDynamoDBに記録する。
+
+  このテーブルは昇格判定（同一digestがstageで成功済みか）の正本であり、
+  **書き込み失敗はデプロイの失敗として扱う**（リトライ3回）。
+
+  記録のない成功を作ると、次のprodリリースで「stageを通っていない」と判定され、
+  原因不明のまま止まる。その時点では理由を追う手がかりが残っていない。
+
+  懸念（意図した副作用）: AWSリソースは更新済みなのにジョブが赤になるため、
+  実行者は「デプロイは成功したのか」を自分で確認する必要がある。
+
+inputs:
+  kind:
+    description: build（成果物の記録）/ deploy（デプロイの記録）
+    required: true
+  service:
+    required: true
+  app:
+    required: false
+    default: ""
+  env:
+    description: "kind=deploy のとき: dev / stage / prod"
+    required: false
+    default: ""
+  commit-sha:
+    required: true
+  image-digest:
+    required: false
+    default: ""
+  image-tag:
+    required: false
+    default: ""
+  branch:
+    required: false
+    default: ""
+  result:
+    required: false
+    default: success
+  ticket-ids:
+    description: カンマ区切り
+    required: false
+    default: ""
+  git-tag:
+    required: false
+    default: ""
+  emergency:
+    required: false
+    default: "false"
+  emergency-reason:
+    required: false
+    default: ""
+  incident-id:
+    required: false
+    default: ""
+  approvals:
+    description: JSON配列。ゲートごとの承認者と日時
+    required: false
+    default: ""
+  scan-report-s3:
+    required: false
+    default: ""
+  releases-table:
+    required: true
+  tickets-table:
+    required: true
+  approval-audit-table:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: boto3の用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check boto3
+
+    - name: 記録
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        ENV_NAME: ${{ inputs.env }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        IMAGE_DIGEST: ${{ inputs.image-digest }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        BRANCH: ${{ inputs.branch }}
+        RESULT: ${{ inputs.result }}
+        TICKET_IDS: ${{ inputs.ticket-ids }}
+        GIT_TAG: ${{ inputs.git-tag }}
+        EMERGENCY: ${{ inputs.emergency }}
+        EMERGENCY_REASON: ${{ inputs.emergency-reason }}
+        INCIDENT_ID: ${{ inputs.incident-id }}
+        APPROVALS: ${{ inputs.approvals }}
+        SCAN_REPORT_S3: ${{ inputs.scan-report-s3 }}
+        RELEASES_TABLE: ${{ inputs.releases-table }}
+        TICKETS_TABLE: ${{ inputs.tickets-table }}
+        APPROVAL_AUDIT_TABLE: ${{ inputs.approval-audit-table }}
+      run: |
+        set -euo pipefail
+
+        script="${GITHUB_ACTION_PATH}/../../scripts/release_store.py"
+        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        if [[ "${KIND}" == "build" ]]; then
+          python3 "${script}" record-build \
+            --service "${SERVICE}" \
+            --app "${APP}" \
+            --commit-sha "${COMMIT_SHA}" \
+            --image-digest "${IMAGE_DIGEST}" \
+            --image-tag "${IMAGE_TAG}" \
+            --run-url "${run_url}" \
+            --scan-report-s3 "${SCAN_REPORT_S3}"
+        else
+          args=(
+            record-deploy
+            --service "${SERVICE}"
+            --app "${APP}"
+            --env "${ENV_NAME}"
+            --commit-sha "${COMMIT_SHA}"
+            --image-digest "${IMAGE_DIGEST}"
+            --branch "${BRANCH}"
+            --result "${RESULT}"
+            --ticket-ids "${TICKET_IDS}"
+            --git-tag "${GIT_TAG}"
+            --emergency-reason "${EMERGENCY_REASON}"
+            --incident-id "${INCIDENT_ID}"
+            --approvals "${APPROVALS}"
+            --run-url "${run_url}"
+            --scan-report-s3 "${SCAN_REPORT_S3}"
+          )
+          if [[ "${EMERGENCY}" == "true" ]]; then
+            args+=(--emergency)
+          fi
+          python3 "${script}" "${args[@]}"
+        fi

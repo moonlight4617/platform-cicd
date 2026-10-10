@@ -1,0 +1,396 @@
+# prod環境へのリリース（ADR-0003, ADR-0004, ADR-0005）
+#
+# 承認3段。段ごとに異なるペルソナが承認する（FR-22）。
+#
+# なぜ承認用の環境を3つ直列につなぐのか:
+#   1つの環境に3人を登録すると、GitHubの仕様上「登録者のうち誰か1人の承認」で
+#   通過してしまい、3段階の承認にならない。
+#
+# 事前チェック（FR-33）で次を検証し、1つでも満たさなければ停止する:
+#   - 指定されたdigestがmain由来の成果物であること
+#   - 同一digestがstageで成功していること（devでの成功は根拠にならない）
+#   - 未報告の緊急リリースがないこと（ADR-0011）
+#
+# 呼び出し側（アプリリポジトリ）:
+#
+#   name: Release prod
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         commit_sha: { required: true }
+#         ticket_ids: { required: true }
+#   permissions:
+#     contents: write       # Gitタグの作成に必要
+#     id-token: write
+#   jobs:
+#     release:
+#       uses: moonlight4617/platform-cicd/.github/workflows/release-prod.yml@v1
+#       with:
+#         commit_sha: ${{ inputs.commit_sha }}
+#         ticket_ids: ${{ inputs.ticket_ids }}
+#       secrets: inherit
+
+name: prodへのリリース
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        description: リリース対象のcommit SHA
+        type: string
+        required: true
+      ticket_ids:
+        description: 関連チケットID（カンマ区切り）。本番リリースでは必須
+        type: string
+        required: true
+      version:
+        description: Gitタグに使うバージョン（例 1.4.0）。省略時は日時
+        type: string
+        required: false
+        default: ""
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 事前チェックとセキュリティゲート
+  # 承認を求める前に実施する。承認者に「通らないリリース」を見せないため
+  # ---------------------------------------------------------------------------
+  checks:
+    name: 事前チェックとセキュリティゲート
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      service: ${{ steps.app.outputs.service }}
+      app: ${{ steps.app.outputs.app }}
+      name-prefix: ${{ steps.app.outputs.name-prefix }}
+      terraform-dir: ${{ steps.app.outputs.terraform-dir }}
+      commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+      image-digest: ${{ steps.resolve.outputs.image-digest }}
+      git-tag: ${{ steps.tag.outputs.git-tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - name: チケットIDの検証
+        shell: bash
+        env:
+          TICKET_IDS: ${{ inputs.ticket_ids }}
+        run: |
+          set -euo pipefail
+          # FR-30: 本番リリースは擬似チケットと必ず紐づける
+          if [[ -z "${TICKET_IDS// /}" ]]; then
+            echo "::error::本番リリースにはチケットIDの指定が必須です（FR-30）"
+            exit 1
+          fi
+          echo "チケット: ${TICKET_IDS}"
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - id: resolve
+        uses: moonlight4617/platform-cicd/actions/release-resolve@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          commit-sha: ${{ inputs.commit_sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      # ここで「stageを通っていない成果物」と
+      # 「未報告の緊急リリースが残っているアプリ」を止める
+      - name: 事前チェック
+        uses: moonlight4617/platform-cicd/actions/release-precheck@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: prod
+          image-digest: ${{ steps.resolve.outputs.image-digest }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: セキュリティゲート
+        uses: moonlight4617/platform-cicd/actions/release-scan-gate@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: prod
+          commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+          image-uri: ""
+          reports-bucket: ${{ secrets.REPORTS_BUCKET }}
+
+      - name: Gitタグ名の決定
+        id: tag
+        shell: bash
+        env:
+          APP: ${{ steps.app.outputs.app }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION}"
+          if [[ -z "${version}" ]]; then
+            version="$(date -u +%Y%m%d-%H%M%S)"
+          fi
+          echo "git-tag=${APP}/v${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: 承認待ちの通知（1段目）
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: info
+          title: "本番リリースの承認待ち（1/3 開発リード）: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            commit `${{ steps.resolve.outputs.commit-sha }}` の本番リリースが
+            承認待ちです。事前チェック（stage成功済み・main由来・緊急リリースの事後報告）
+            とセキュリティゲートは通過しています。
+            チケット: ${{ inputs.ticket_ids }}
+          mention-personas: dev_lead
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 承認画面を開く
+
+      - name: 停止時の通知
+        if: failure()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: failure
+          title: "本番リリースが停止: ${{ steps.app.outputs.name-prefix }}"
+          body: 事前チェックまたはセキュリティゲートで停止しました。承認の前段階です。
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く
+
+  # ---------------------------------------------------------------------------
+  # 承認ゲート 1段目: 開発リード（変更内容の妥当性）
+  # ---------------------------------------------------------------------------
+  approve-1:
+    name: 承認 1/3（開発リード）
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: prod-approval-1
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: moonlight4617/platform-cicd/actions/record-approval@v1
+        with:
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: prod
+          gate: prod-approval-1
+          persona: dev_lead
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+      - name: 次の承認者へ通知
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: info
+          title: "本番リリースの承認待ち（2/3 QA・PO）: ${{ needs.checks.outputs.name-prefix }}"
+          body: >-
+            1段目（開発リード）の承認が完了しました。
+            stageでの確認結果とリリース可否を判断してください。
+          mention-personas: qa_po
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 承認画面を開く
+
+  # ---------------------------------------------------------------------------
+  # 承認ゲート 2段目: QA / PO（stageでの確認結果、リリース可否）
+  # ---------------------------------------------------------------------------
+  approve-2:
+    name: 承認 2/3（QA・PO）
+    needs: [checks, approve-1]
+    runs-on: ubuntu-latest
+    environment: prod-approval-2
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: moonlight4617/platform-cicd/actions/record-approval@v1
+        with:
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: prod
+          gate: prod-approval-2
+          persona: qa_po
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+      - name: 次の承認者へ通知
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: info
+          title: "本番リリースの承認待ち（3/3 SRE）: ${{ needs.checks.outputs.name-prefix }}"
+          body: >-
+            2段目（QA・PO）の承認が完了しました。
+            リリース時間帯、影響範囲、切り戻し手順を確認してください。
+          mention-personas: sre
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 承認画面を開く
+
+  # ---------------------------------------------------------------------------
+  # 承認ゲート 3段目: SRE（リリース時間帯、影響範囲、切り戻し手順）
+  # ---------------------------------------------------------------------------
+  approve-3:
+    name: 承認 3/3（SRE）
+    needs: [checks, approve-2]
+    runs-on: ubuntu-latest
+    environment: prod-approval-3
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: moonlight4617/platform-cicd/actions/record-approval@v1
+        with:
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: prod
+          gate: prod-approval-3
+          persona: sre
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+  # ---------------------------------------------------------------------------
+  # デプロイ（3段の承認を通過した後）
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: prod へデプロイ
+    needs: [checks, approve-1, approve-2, approve-3]
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency:
+      group: release-prod-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write        # Gitタグの作成
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 承認対象のcommitをデプロイする
+          ref: ${{ needs.checks.outputs.commit-sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - name: terraform apply
+        uses: moonlight4617/platform-cicd/actions/terraform-apply@v1
+        with:
+          terraform-dir: ${{ needs.checks.outputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+          env: prod
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          tfstate-bucket: ${{ secrets.TFSTATE_BUCKET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          image-digest: ${{ needs.checks.outputs.image-digest }}
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+
+      # ADR-0010: commit SHA・タグ・digestの3つすべてを残す。
+      # digestは同一性の保証、SHAはソースへの到達、タグは人間が読む識別子
+      - name: Gitタグの作成
+        if: success()
+        shell: bash
+        env:
+          GIT_TAG: ${{ needs.checks.outputs.git-tag }}
+          COMMIT_SHA: ${{ needs.checks.outputs.commit-sha }}
+          TICKET_IDS: ${{ inputs.ticket_ids }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${GIT_TAG}" "${COMMIT_SHA}" \
+            -m "本番リリース: ${TICKET_IDS} (run ${GITHUB_RUN_ID})"
+          git push origin "${GIT_TAG}"
+          echo "タグを作成しました: ${GIT_TAG}"
+
+      - name: リリースの記録とチケットへの紐づけ
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/release-record@v1
+        with:
+          kind: deploy
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: prod
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          image-digest: ${{ needs.checks.outputs.image-digest }}
+          branch: main
+          result: ${{ job.status == 'success' && 'success' || 'failed' }}
+          ticket-ids: ${{ inputs.ticket_ids }}
+          git-tag: ${{ needs.checks.outputs.git-tag }}
+          approvals: >-
+            [{"gate":"prod-approval-1","persona":"dev_lead"},
+             {"gate":"prod-approval-2","persona":"qa_po"},
+             {"gate":"prod-approval-3","persona":"sre"}]
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 通知
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          title: "本番リリース${{ job.status == 'success' && '完了' || '失敗' }}: ${{ needs.checks.outputs.name-prefix }}"
+          body: >-
+            タグ `${{ needs.checks.outputs.git-tag }}` /
+            commit `${{ needs.checks.outputs.commit-sha }}` を本番へリリースしました。
+            チケット: ${{ inputs.ticket_ids }}
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

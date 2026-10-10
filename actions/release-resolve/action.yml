@@ -1,0 +1,65 @@
+name: リリース対象の解決
+description: >
+  commit SHA または digest の一方から、もう一方を成果物の記録から引く（FR-33）。
+
+  成果物の記録（kind=build）は mainマージ時にのみ作られる。
+  したがって記録が見つからないものはリリースできない。
+  これが「main由来の成果物しかリリースできない」ことの実装である。
+
+inputs:
+  service:
+    required: true
+  app:
+    required: true
+  commit-sha:
+    description: どちらか一方を指定する
+    required: false
+    default: ""
+  image-digest:
+    required: false
+    default: ""
+  releases-table:
+    required: true
+  tickets-table:
+    required: true
+  approval-audit-table:
+    required: true
+
+outputs:
+  commit-sha:
+    description: 解決されたcommit SHA
+    value: ${{ steps.resolve.outputs.commit-sha }}
+  image-digest:
+    description: 解決されたdigest。デプロイ時はこれを使う
+    value: ${{ steps.resolve.outputs.image-digest }}
+  image-tag:
+    value: ${{ steps.resolve.outputs.image-tag }}
+  built-at:
+    value: ${{ steps.resolve.outputs.built-at }}
+
+runs:
+  using: composite
+  steps:
+    - name: boto3の用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check boto3
+
+    - name: 解決
+      id: resolve
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        IMAGE_DIGEST: ${{ inputs.image-digest }}
+        RELEASES_TABLE: ${{ inputs.releases-table }}
+        TICKETS_TABLE: ${{ inputs.tickets-table }}
+        APPROVAL_AUDIT_TABLE: ${{ inputs.approval-audit-table }}
+      run: |
+        set -euo pipefail
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/release_store.py" resolve \
+          --service "${SERVICE}" \
+          --app "${APP}" \
+          --commit-sha "${COMMIT_SHA}" \
+          --image-digest "${IMAGE_DIGEST}" \
+          --github-output "${GITHUB_OUTPUT}"

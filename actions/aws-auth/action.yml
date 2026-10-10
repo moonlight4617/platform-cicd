@@ -1,0 +1,88 @@
+name: AWS 認証（OIDC）
+description: >
+  アカウントIDをマスクしてからOIDCでIAMロールを引き受ける。
+  ADR-0002の対策3（マスク）を忘れられない構造にするため、
+  認証と同じactionにまとめている。
+
+inputs:
+  role-arn:
+    description: 引き受けるIAMロールのARN。GitHub Secretsから渡す（ADR-0002）
+    required: true
+  aws-region:
+    description: AWSリージョン
+    required: true
+  account-id:
+    description: >
+      マスク対象のAWSアカウントID。省略した場合はrole-arnから抽出する。
+    required: false
+    default: ""
+  mask-extra:
+    description: 追加でマスクする値（カンマ区切り）。バケット名など
+    required: false
+    default: ""
+
+outputs:
+  account-id:
+    description: 認証に成功したアカウントID（マスク済みなのでログには出ない）
+    value: ${{ steps.verify.outputs.account-id }}
+
+runs:
+  using: composite
+  steps:
+    # 認証より先にマスクを登録する。順序が逆だと、認証の失敗メッセージに
+    # ARNが出た時点で公開される（publicリポジトリ）
+    - name: 機密値をマスク
+      shell: bash
+      env:
+        ROLE_ARN: ${{ inputs.role-arn }}
+        ACCOUNT_ID: ${{ inputs.account-id }}
+        MASK_EXTRA: ${{ inputs.mask-extra }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${ROLE_ARN}" ]]; then
+          echo "::error::role-arn が空です。GitHub Secrets の設定を確認してください"
+          exit 1
+        fi
+
+        # ARN全体と、そこから抽出したアカウントIDの両方をマスクする
+        echo "::add-mask::${ROLE_ARN}"
+
+        account="${ACCOUNT_ID}"
+        if [[ -z "${account}" ]]; then
+          # arn:aws:iam::123456789012:role/xxx の5番目のフィールド
+          account="$(echo "${ROLE_ARN}" | cut -d: -f5)"
+        fi
+        if [[ -n "${account}" ]]; then
+          echo "::add-mask::${account}"
+          echo "AWS_ACCOUNT_ID=${account}" >> "${GITHUB_ENV}"
+        fi
+
+        if [[ -n "${MASK_EXTRA}" ]]; then
+          IFS=',' read -ra extras <<< "${MASK_EXTRA}"
+          for value in "${extras[@]}"; do
+            trimmed="$(echo "${value}" | xargs)"
+            # 短すぎる値をマスクするとログが読めなくなる
+            if [[ ${#trimmed} -ge 4 ]]; then
+              echo "::add-mask::${trimmed}"
+            fi
+          done
+        fi
+
+    - name: OIDCでロールを引き受け
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: gha-${{ github.run_id }}
+        mask-aws-account-id: true
+
+    - name: 認証の確認
+      id: verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        account="$(aws sts get-caller-identity --query Account --output text)"
+        echo "::add-mask::${account}"
+        echo "account-id=${account}" >> "${GITHUB_OUTPUT}"
+        echo "AWS認証に成功しました（アカウントIDはマスク済み）"

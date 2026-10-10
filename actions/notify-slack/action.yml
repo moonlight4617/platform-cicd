@@ -1,0 +1,70 @@
+name: Slack通知
+description: >
+  Incoming Webhookで通知する（ADR-0015）。通知は一方向で、承認操作はSlackから行わない。
+  承認判定の正本をGitHubに置いているため（ADR-0003）、Slackに操作を持たせると
+  判定経路が2つになる。
+
+  通知本文にARN・アカウントID・リソース名を含めない。Slackは転送・
+  スクリーンショットされやすいため、ADR-0002の隔離方針を通知にも適用する。
+
+inputs:
+  webhook-url:
+    description: Incoming WebhookのURL。GitHub Secretsから渡す
+    required: true
+  status:
+    description: success / failure / warning / info
+    required: true
+  title:
+    description: 1行の見出し
+    required: true
+  body:
+    description: 本文（Markdown風のSlack記法）
+    required: false
+    default: ""
+  mention-personas:
+    description: >
+      メンションするペルソナ（カンマ区切り。dev_lead / qa_po / sre）。
+      config/approvers.yaml でSlackのユーザーIDに解決する。
+    required: false
+    default: ""
+  link-url:
+    description: 「開く」ボタンのリンク先。承認画面やIssueのURL
+    required: false
+    default: ""
+  link-text:
+    description: ボタンの文言
+    required: false
+    default: GitHubで開く
+
+runs:
+  using: composite
+  steps:
+    - name: 通知
+      shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.webhook-url }}
+        STATUS: ${{ inputs.status }}
+        TITLE: ${{ inputs.title }}
+        BODY: ${{ inputs.body }}
+        MENTION_PERSONAS: ${{ inputs.mention-personas }}
+        LINK_URL: ${{ inputs.link-url }}
+        LINK_TEXT: ${{ inputs.link-text }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "${WEBHOOK_URL}" ]]; then
+          echo "::warning::SLACK_WEBHOOK_URL が未設定のため通知をスキップします"
+          exit 0
+        fi
+        echo "::add-mask::${WEBHOOK_URL}"
+
+        pip install --quiet --disable-pip-version-check pyyaml
+
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/notify_slack.py" \
+          --approvers "${GITHUB_ACTION_PATH}/../../config/approvers.yaml" \
+          --status "${STATUS}" \
+          --title "${TITLE}" \
+          --body "${BODY}" \
+          --mention-personas "${MENTION_PERSONAS}" \
+          --link-url "${LINK_URL}" \
+          --link-text "${LINK_TEXT}"

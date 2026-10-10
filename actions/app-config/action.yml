@@ -1,0 +1,57 @@
+name: アプリ設定の読み込み
+description: >
+  アプリリポジトリの .platform/app.yaml を読み、後続のジョブが使う値を出力する（ADR-0001）。
+  アプリ側の記述を「宣言」だけに絞るための入口。
+  ここで検証を行うことで、設定の不備をCIの最初に落とす。
+
+inputs:
+  path:
+    description: 設定ファイルのパス
+    required: false
+    default: .platform/app.yaml
+
+outputs:
+  service:
+    description: サービス名
+    value: ${{ steps.read.outputs.service }}
+  app:
+    description: アプリ名。infraリポジトリでは空
+    value: ${{ steps.read.outputs.app }}
+  runtime:
+    description: java / python / typescript / none
+    value: ${{ steps.read.outputs.runtime }}
+  deploy:
+    description: ecs / lambda / infra
+    value: ${{ steps.read.outputs.deploy }}
+  build-per-env:
+    description: 環境別ビルドの例外（ADR-0005）。true / false
+    value: ${{ steps.read.outputs.build-per-env }}
+  terraform-dir:
+    description: Terraformのディレクトリ
+    value: ${{ steps.read.outputs.terraform-dir }}
+  name-prefix:
+    description: <service>-<app> 形式。リソース名に使う
+    value: ${{ steps.read.outputs.name-prefix }}
+  ecr-repository:
+    description: >
+      ECRリポジトリ名。ECRは小文字のみ許可されるため name-prefix を小文字化したもの。
+      ECSのサービス名やIAMロール名には name-prefix を使う。
+    value: ${{ steps.read.outputs.ecr-repository }}
+
+runs:
+  using: composite
+  steps:
+    - name: PyYAMLの用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check pyyaml
+
+    - name: app.yaml を読んで検証
+      id: read
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/read_app_config.py" \
+          --path "${CONFIG_PATH}" \
+          --github-output "${GITHUB_OUTPUT}"

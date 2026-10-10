@@ -1,0 +1,279 @@
+name: 静的解析・脆弱性診断
+description: >
+  共通ツールとランタイム別ツールを実行し、結果をSARIFで1つのディレクトリに集める（ADR-0008）。
+  判定は行わない（gate action の責務）。出力形式をSARIFに統一することで、
+  ツールを追加しても判定ロジックが増えない状態を保つ。
+
+inputs:
+  runtime:
+    description: java / python / typescript / none
+    required: true
+  output-dir:
+    description: SARIFの出力先
+    required: false
+    default: reports
+  image-ref:
+    description: コンテナイメージの参照。指定時は trivy image も実行する
+    required: false
+    default: ""
+  terraform-dir:
+    description: IaCスキャンの対象ディレクトリ
+    required: false
+    default: terraform
+  skip-tools:
+    description: 実行しないツール（カンマ区切り）。切り分け用
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: ツールの用意
+      shell: bash
+      env:
+        SKIP_TOOLS: ${{ inputs.skip-tools }}
+      run: |
+        set -euo pipefail
+        # バージョン固定の値を読み込む（空なら最新版）
+        set -a
+        source "${GITHUB_ACTION_PATH}/../../config/tool-versions.env"
+        set +a
+
+        mkdir -p "${RUNNER_TEMP}/tools"
+
+        install_trivy() {
+          if [[ -n "${TRIVY_VERSION}" ]]; then
+            curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh" \
+              | sh -s -- -b "${RUNNER_TEMP}/tools" "v${TRIVY_VERSION}"
+          else
+            curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh" \
+              | sh -s -- -b "${RUNNER_TEMP}/tools"
+          fi
+        }
+
+        install_gitleaks() {
+          local version="${GITLEAKS_VERSION}"
+          if [[ -z "${version}" ]]; then
+            version="$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')"
+          fi
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}/tools" gitleaks
+        }
+
+        install_trivy
+        install_gitleaks
+
+        if [[ -n "${SEMGREP_VERSION}" ]]; then
+          pip install --quiet --disable-pip-version-check "semgrep==${SEMGREP_VERSION}"
+        else
+          pip install --quiet --disable-pip-version-check semgrep
+        fi
+
+        pip install --quiet --disable-pip-version-check pyyaml
+
+        echo "${RUNNER_TEMP}/tools" >> "${GITHUB_PATH}"
+
+        echo "--- 使用バージョン（固定のため記録） ---"
+        "${RUNNER_TEMP}/tools/trivy" --version | head -1
+        "${RUNNER_TEMP}/tools/gitleaks" version
+        semgrep --version
+
+    # -----------------------------------------------------------------------
+    # 共通ツール
+    # -----------------------------------------------------------------------
+    - name: Semgrep（SAST）
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUT}"
+        # --error を付けない。停止の判定は gate action が行う
+        semgrep scan \
+          --config=p/default \
+          --config=p/secrets \
+          --sarif \
+          --output "${OUT}/semgrep.sarif" \
+          --metrics=off \
+          --quiet \
+          . || true
+        test -s "${OUT}/semgrep.sarif" || {
+          echo "::error::Semgrepのレポートが生成されませんでした。スキャン失敗を「問題なし」として通さないため中断します"
+          exit 1
+        }
+
+    - name: Trivy（依存ライブラリ・シークレット）
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUT}"
+        # SARIFではなくJSONで取得する。組み込みSARIFは FixedVersion を
+        # 構造化して残さず、ADR-0008のゲート基準を判定できないため
+        trivy fs \
+          --scanners vuln,secret \
+          --format json \
+          --output "${RUNNER_TEMP}/trivy-fs.json" \
+          --no-progress \
+          .
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/trivy_to_sarif.py" \
+          --input "${RUNNER_TEMP}/trivy-fs.json" \
+          --output "${OUT}/trivy-fs.sarif" \
+          --tool-name trivy-fs
+
+    - name: Trivy（IaC）
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+        TF_DIR: ${{ inputs.terraform-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUT}"
+        if [[ ! -d "${TF_DIR}" ]]; then
+          echo "${TF_DIR} が存在しないためIaCスキャンをスキップします"
+          exit 0
+        fi
+        trivy config \
+          --format json \
+          --output "${RUNNER_TEMP}/trivy-config.json" \
+          --no-progress \
+          "${TF_DIR}"
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/trivy_to_sarif.py" \
+          --input "${RUNNER_TEMP}/trivy-config.json" \
+          --output "${OUT}/trivy-config.sarif" \
+          --tool-name trivy-config
+
+    - name: Trivy（コンテナイメージ）
+      if: inputs.image-ref != ''
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+        IMAGE_REF: ${{ inputs.image-ref }}
+      run: |
+        set -euo pipefail
+        trivy image \
+          --format json \
+          --output "${RUNNER_TEMP}/trivy-image.json" \
+          --no-progress \
+          "${IMAGE_REF}"
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/trivy_to_sarif.py" \
+          --input "${RUNNER_TEMP}/trivy-image.json" \
+          --output "${OUT}/trivy-image.sarif" \
+          --tool-name trivy-image
+
+    - name: gitleaks（シークレット混入）
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUT}"
+        # 検出があっても終了コード1になるが、判定は gate action が行う。
+        # ただしレポートが生成されないケースと区別する必要がある
+        set +e
+        gitleaks detect \
+          --source . \
+          --report-format sarif \
+          --report-path "${OUT}/gitleaks.sarif" \
+          --redact \
+          --exit-code 0 \
+          --no-banner
+        status=$?
+        set -e
+        if [[ ${status} -ne 0 ]] || [[ ! -f "${OUT}/gitleaks.sarif" ]]; then
+          echo "::error::gitleaksの実行に失敗しました（終了コード ${status}）"
+          exit 1
+        fi
+
+    # -----------------------------------------------------------------------
+    # ランタイム別のLint
+    #
+    # 各アプリは、ここで実行されるコマンドがSARIFを出せる状態にしておく必要がある
+    # （platform-cicd/README.md のアプリ側の規約を参照）
+    # -----------------------------------------------------------------------
+    - name: Lint（Python / ruff）
+      if: inputs.runtime == 'python'
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        set -a
+        source "${GITHUB_ACTION_PATH}/../../config/tool-versions.env"
+        set +a
+        if [[ -n "${RUFF_VERSION}" ]]; then
+          pip install --quiet --disable-pip-version-check "ruff==${RUFF_VERSION}"
+        else
+          pip install --quiet --disable-pip-version-check ruff
+        fi
+        ruff check --output-format sarif --output-file "${OUT}/ruff.sarif" . || true
+        test -s "${OUT}/ruff.sarif" || {
+          echo "::error::ruffのレポートが生成されませんでした"
+          exit 1
+        }
+
+    - name: Lint（TypeScript / ESLint）
+      if: inputs.runtime == 'typescript'
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        npm ci
+        # アプリ側が @microsoft/eslint-formatter-sarif を devDependencies に
+        # 持っている必要がある（規約）
+        npx eslint . \
+          --format @microsoft/eslint-formatter-sarif \
+          --output-file "${OUT}/eslint.sarif" || true
+        test -s "${OUT}/eslint.sarif" || {
+          echo "::error::ESLintのレポートが生成されませんでした。@microsoft/eslint-formatter-sarif が devDependencies にあるか確認してください"
+          exit 1
+        }
+
+    - name: Lint（Java / SpotBugs）
+      if: inputs.runtime == 'java'
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        # Gradle Wrapper があればそれを使う（バージョンが固定されるため望ましい）。
+        # 無い場合は環境のgradleにフォールバックする
+        if [[ -x ./gradlew ]]; then
+          gradle_cmd="./gradlew"
+        elif command -v gradle >/dev/null 2>&1; then
+          echo "::warning file=gradlew::Gradle Wrapper がありません。環境のgradleを使います。'gradle wrapper' でWrapperを追加してください（ビルドの再現性のため）"
+          gradle_cmd="gradle"
+        else
+          echo "::error::gradlew も gradle も見つかりません"
+          exit 1
+        fi
+
+        # アプリ側のbuild.gradleで spotbugs の sarif 出力を有効にしておく必要がある（規約）
+        "${gradle_cmd}" --no-daemon --console=plain spotbugsMain || true
+        found=0
+        while IFS= read -r -d '' file; do
+          cp "${file}" "${OUT}/spotbugs-$(basename "$(dirname "${file}")")-$(basename "${file}")"
+          found=1
+        done < <(find build -name "*.sarif" -print0 2>/dev/null)
+        if [[ ${found} -eq 0 ]]; then
+          echo "::error::SpotBugsのSARIFが見つかりませんでした。build.gradle で spotbugs の sarif 出力を有効にしてください"
+          exit 1
+        fi
+
+    - name: 収集結果の確認
+      shell: bash
+      env:
+        OUT: ${{ inputs.output-dir }}
+      run: |
+        set -euo pipefail
+        echo "--- 収集したSARIF ---"
+        ls -la "${OUT}"
+        count="$(find "${OUT}" -name '*.sarif' | wc -l)"
+        if [[ "${count}" -eq 0 ]]; then
+          echo "::error::SARIFが1件も生成されていません"
+          exit 1
+        fi
+        echo "${count} 件のSARIFを収集しました"

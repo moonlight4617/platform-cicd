@@ -1,0 +1,245 @@
+# 緊急リリース（ADR-0011）
+#
+# 本番障害時、3段の承認を待っている間に被害が拡大するため、
+# 承認1段（SRE）で本番へリリースできる経路。
+#
+# 通常経路との違い:
+#   - 承認が1段（SRE）
+#   - セキュリティゲートをスキップする（結果の記録は行う）
+#   - stage経由の検証を要求しない
+#   - インシデントIDと理由の入力が必須
+#
+# 代償として、**事後報告をするまで同一アプリの通常prodリリースがブロックされる。**
+# 催促通知ではなくブロックにした理由: 通知は無視できる。
+# 事後報告は「重要だが急ぎではない」タスクなので、次の通常リリースが
+# 止まる状態を作らないと確実に後回しになる。
+#
+# ただし緊急リリース経路そのものは再度使える。
+# 障害が連鎖したときに復旧手段を封じないため。
+#
+# 呼び出し側（アプリリポジトリ）:
+#
+#   name: Emergency release
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         commit_sha:  { required: true }
+#         incident_id: { required: true }
+#         reason:      { required: true }
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     release:
+#       uses: moonlight4617/platform-cicd/.github/workflows/emergency-release.yml@v1
+#       with:
+#         commit_sha: ${{ inputs.commit_sha }}
+#         incident_id: ${{ inputs.incident_id }}
+#         reason: ${{ inputs.reason }}
+#       secrets: inherit
+
+name: 緊急リリース
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        description: リリース対象のcommit SHA（ロールバック時は過去のSHA）
+        type: string
+        required: true
+      incident_id:
+        description: インシデントID。事後報告の起点になる
+        type: string
+        required: true
+      reason:
+        description: 緊急リリースを行う理由
+        type: string
+        required: true
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: 入力の検証と対象の解決
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      service: ${{ steps.app.outputs.service }}
+      app: ${{ steps.app.outputs.app }}
+      name-prefix: ${{ steps.app.outputs.name-prefix }}
+      terraform-dir: ${{ steps.app.outputs.terraform-dir }}
+      commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+      image-digest: ${{ steps.resolve.outputs.image-digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - name: 入力の検証
+        shell: bash
+        env:
+          INCIDENT_ID: ${{ inputs.incident_id }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          # 後から「なぜこの緊急リリースをしたのか」が分からなくなると、
+          # 事後報告そのものが書けなくなる（ADR-0011）
+          if [[ -z "${INCIDENT_ID// /}" ]]; then
+            echo "::error::インシデントIDの指定が必須です"
+            exit 1
+          fi
+          if [[ "${#REASON}" -lt 10 ]]; then
+            echo "::error::理由を10文字以上で記述してください（事後報告の起点になります）"
+            exit 1
+          fi
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      # main由来の成果物であることは緊急時でも要求する。
+      # 「どのコードを出したか」が分からない状態で本番を触らせないため
+      - id: resolve
+        uses: moonlight4617/platform-cicd/actions/release-resolve@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          commit-sha: ${{ inputs.commit_sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      # セキュリティゲートは実施するが、停止させない（ADR-0011）。
+      # 脆弱性のために障害復旧ができない状態を避けるため。
+      # ただし何を許容して出したかは記録に残す
+      - name: セキュリティ検査（記録のみ・停止させない）
+        continue-on-error: true
+        uses: moonlight4617/platform-cicd/actions/release-scan-gate@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: prod
+          commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+          image-uri: ""
+          reports-bucket: ${{ secrets.REPORTS_BUCKET }}
+          fail-on-block: "false"
+
+      - name: 承認待ちの通知
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: warning
+          title: "【緊急】本番リリースの承認待ち: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            インシデント `${{ inputs.incident_id }}` への対応として、
+            ${{ github.actor }} が緊急リリースを要求しました。
+            理由: ${{ inputs.reason }}
+            対象commit: `${{ steps.resolve.outputs.commit-sha }}`
+            セキュリティゲートはスキップされます。
+          mention-personas: sre
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 承認画面を開く
+
+  deploy:
+    name: "緊急デプロイ（承認: SRE）"
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: prod-emergency
+    concurrency:
+      group: release-prod-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.checks.outputs.commit-sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - uses: moonlight4617/platform-cicd/actions/record-approval@v1
+        with:
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: prod
+          gate: prod-emergency
+          persona: sre
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: terraform apply
+        uses: moonlight4617/platform-cicd/actions/terraform-apply@v1
+        with:
+          terraform-dir: ${{ needs.checks.outputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+          env: prod
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          tfstate-bucket: ${{ secrets.TFSTATE_BUCKET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          image-digest: ${{ needs.checks.outputs.image-digest }}
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+
+      # emergency: true かつ postmortem_filed: false で記録する。
+      # この記録が残っている間、通常のprodリリースはブロックされる
+      - name: リリースの記録
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/release-record@v1
+        with:
+          kind: deploy
+          service: ${{ needs.checks.outputs.service }}
+          app: ${{ needs.checks.outputs.app }}
+          env: prod
+          commit-sha: ${{ needs.checks.outputs.commit-sha }}
+          image-digest: ${{ needs.checks.outputs.image-digest }}
+          branch: main
+          result: ${{ job.status == 'success' && 'success' || 'failed' }}
+          emergency: "true"
+          emergency-reason: ${{ inputs.reason }}
+          incident-id: ${{ inputs.incident_id }}
+          approvals: >-
+            [{"gate":"prod-emergency","persona":"sre","github_user":"${{ github.actor }}"}]
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 完了と事後報告の案内
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: ${{ job.status == 'success' && 'warning' || 'failure' }}
+          title: "【緊急】本番リリース${{ job.status == 'success' && '完了' || '失敗' }}: ${{ needs.checks.outputs.name-prefix }}"
+          body: >-
+            インシデント `${{ inputs.incident_id }}` への緊急リリースが完了しました。
+            *このアプリの通常prodリリースは、事後報告が登録されるまでブロックされます。*
+            報告は scripts/release_store.py postmortem で登録してください。
+          mention-personas: sre
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

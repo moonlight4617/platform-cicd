@@ -1,0 +1,103 @@
+# 静的解析・脆弱性診断のゲート基準（ADR-0008）
+#
+# このファイルは platform-cicd が所有する。
+# アプリ側からは変更できない。基準の緩和がデプロイ精度のバラツキの
+# 主要因であるため、意図的に一元管理している。
+#
+# アプリ側が持てるのは .platform/security-exceptions.yaml による
+# 個別の抑制のみで、そちらは理由と有効期限が必須。
+
+# ---------------------------------------------------------------------------
+# 深刻度の正規化
+#
+# SARIFには統一された深刻度の表現がない。次の優先順で判定する:
+#   1. rule.properties["security-severity"]（CVSSスコア。Trivy/CodeQLが付与）
+#   2. result.level（error / warning / note）
+# ---------------------------------------------------------------------------
+severity:
+  # CVSSスコアからの変換
+  from_cvss:
+    CRITICAL: 9.0
+    HIGH: 7.0
+    MEDIUM: 4.0
+    LOW: 0.1
+
+  # level からの変換（CVSSがない場合のフォールバック）
+  from_level:
+    error: HIGH
+    warning: MEDIUM
+    note: LOW
+    none: LOW
+
+  order: [CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN]
+
+# ---------------------------------------------------------------------------
+# 修正版の有無が判定できない検出の扱い
+#
+# SASTの検出（Semgrepなど）には「修正版」という概念がない。コードを直す以外に
+# 解決手段がないため、判定不能なものは停止条件に含める（fail closed）。
+#
+#   block : 停止条件に含める
+#   allow : 停止条件から除外する
+# ---------------------------------------------------------------------------
+fix_availability:
+  unknown: block
+
+# ---------------------------------------------------------------------------
+# モードごとの停止条件
+#
+#   pr    : PRのCI。CRITICALのみ停止させ、開発を止めすぎない
+#   dev   : dev環境へのデプロイ。警告のみ（ADR-0008）
+#   stage : stage環境へのデプロイ。ここから停止させる
+#   prod  : prod環境へのデプロイ
+#
+# require_fix_available:
+#   true の場合、修正版が提供されている脆弱性のみを停止条件とする。
+#   修正不能な脆弱性でリリースが永久に止まるのを防ぐため（ADR-0008）。
+#   ただし検出自体はレポートに残る。
+# ---------------------------------------------------------------------------
+gates:
+  pr:
+    block_severities: [CRITICAL]
+    require_fix_available: true
+
+  dev:
+    block_severities: []
+    require_fix_available: true
+
+  stage:
+    block_severities: [CRITICAL, HIGH]
+    require_fix_available: true
+
+  prod:
+    block_severities: [CRITICAL, HIGH]
+    require_fix_available: true
+
+# ---------------------------------------------------------------------------
+# 常に停止させるもの
+#
+# 修正版の有無やモードに関係なく停止する。
+# ---------------------------------------------------------------------------
+always_block:
+  # シークレットの混入。コミットされた時点で漏洩しているため、
+  # publicリポジトリ（ADR-0002）では特に致命的
+  - tool: gitleaks
+    reason: シークレットがコミットに含まれている
+
+  # 有効期限切れの抑制。抑制の恒久化を防ぐ（ADR-0008）
+  - kind: expired_exception
+    reason: security-exceptions.yaml の抑制が有効期限を過ぎている
+
+  # 抑制の記載不備
+  - kind: malformed_exception
+    reason: security-exceptions.yaml の必須項目（reason / expires）が欠けている
+
+# ---------------------------------------------------------------------------
+# 抑制の上限
+#
+# 抑制の有効期限は最長でこの日数まで。
+# 「3年後まで抑制」のような実質的な恒久化を防ぐ。
+# ---------------------------------------------------------------------------
+exceptions:
+  max_days_from_now: 180
+  required_fields: [id, reason, expires, approved_by]

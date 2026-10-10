@@ -1,0 +1,128 @@
+name: terraform apply
+description: >
+  ADR-0007: アプリのデプロイもTerraformで行う。イメージのdigestをvarで渡す。
+
+  デプロイツールとTerraformが同じタスク定義を書き換える構成にしないのは、
+  恒久的なドリフトが発生してドリフト検知（ADR-0012）が機能しなくなるため。
+
+  applyはロックを取得する（CIのplanとは異なる）。
+  ECSサービスの安定を待つのはTerraform側（wait_for_steady_state）に任せ、
+  失敗時はECSのサーキットブレーカーで自動ロールバックさせる。
+
+inputs:
+  terraform-dir:
+    required: false
+    default: terraform
+  terraform-version:
+    required: false
+    default: 1.16.4
+  env:
+    description: dev / stage / prod
+    required: true
+  service:
+    required: true
+  app:
+    required: false
+    default: ""
+  tfstate-bucket:
+    required: true
+  aws-region:
+    required: true
+  image-digest:
+    description: デプロイするイメージのdigest（ADR-0005）
+    required: false
+    default: ""
+  commit-sha:
+    description: デプロイ対象のcommit SHA
+    required: true
+  reports-dir:
+    required: false
+    default: reports/apply
+  extra-vars:
+    description: 追加の -var（改行区切りの KEY=VALUE）
+    required: false
+    default: ""
+
+outputs:
+  outputs-json:
+    description: terraform output の内容（JSON）
+    value: ${{ steps.apply.outputs.outputs-json }}
+
+runs:
+  using: composite
+  steps:
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: init
+      shell: bash
+      working-directory: ${{ inputs.terraform-dir }}
+      env:
+        TFSTATE_BUCKET: ${{ inputs.tfstate-bucket }}
+        AWS_REGION_INPUT: ${{ inputs.aws-region }}
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        ENV_NAME: ${{ inputs.env }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${TFSTATE_BUCKET}"
+
+        # ADR-0007: <service>/<app>/<env>/terraform.tfstate
+        # IAMが */*/<env>/* で絞っているため3階層は必須
+        app_part="${APP:-_infra}"
+        terraform init \
+          -input=false \
+          -no-color \
+          -backend-config="bucket=${TFSTATE_BUCKET}" \
+          -backend-config="key=${SERVICE}/${app_part}/${ENV_NAME}/terraform.tfstate" \
+          -backend-config="region=${AWS_REGION_INPUT}"
+
+    - name: apply
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.terraform-dir }}
+      env:
+        ENV_NAME: ${{ inputs.env }}
+        IMAGE_DIGEST: ${{ inputs.image-digest }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        EXTRA_VARS: ${{ inputs.extra-vars }}
+        REPORTS_DIR: ${{ inputs.reports-dir }}
+      run: |
+        set -euo pipefail
+
+        args=(-input=false -no-color -auto-approve)
+
+        if [[ -f "env/${ENV_NAME}.tfvars" ]]; then
+          args+=("-var-file=env/${ENV_NAME}.tfvars")
+        fi
+        if [[ -n "${IMAGE_DIGEST}" ]]; then
+          args+=("-var=image_digest=${IMAGE_DIGEST}")
+        fi
+        args+=("-var=commit_sha=${COMMIT_SHA}")
+
+        if [[ -n "${EXTRA_VARS}" ]]; then
+          while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            args+=("-var=${line}")
+          done <<< "${EXTRA_VARS}"
+        fi
+
+        mkdir -p "${GITHUB_WORKSPACE}/${REPORTS_DIR}"
+
+        set +e
+        terraform apply "${args[@]}" 2>&1 | tee "${GITHUB_WORKSPACE}/${REPORTS_DIR}/apply.log"
+        status=${PIPESTATUS[0]}
+        set -e
+
+        if [[ ${status} -ne 0 ]]; then
+          echo "::error::terraform apply が失敗しました。ECSのサーキットブレーカーにより、デプロイは自動ロールバックされている可能性があります"
+          exit 1
+        fi
+
+        # outputはsensitiveを含むためファイルに出し、ログには出さない
+        terraform output -json > "${RUNNER_TEMP}/tf-outputs.json"
+        echo "outputs-json=${RUNNER_TEMP}/tf-outputs.json" >> "${GITHUB_OUTPUT}"
+
+        echo "apply が完了しました"

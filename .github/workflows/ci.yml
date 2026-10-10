@@ -1,0 +1,351 @@
+# 共通CIワークフロー（ADR-0004）
+#
+# 各アプリリポジトリはこれを呼ぶだけ。アプリ側に処理を書かせないことで、
+# チームごとの実装差が生まれる余地をなくす（ADR-0001）。
+#
+# 呼び出し側（アプリリポジトリ）の .github/workflows/ci.yml:
+#
+#   name: CI
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#     id-token: write
+#     pull-requests: write
+#   jobs:
+#     ci:
+#       uses: moonlight4617/platform-cicd/.github/workflows/ci.yml@v1
+#       secrets: inherit
+#
+# ジョブの分割（ADR-0002）:
+#   scan      : シークレット不要。フォークからのPRでも実行する
+#   terraform : AWSに触る。フォークからのPRではスキップする
+#   report    : AWSに触る（S3）。フォークからのPRではスキップする
+
+name: 共通CI
+
+on:
+  workflow_call:
+    inputs:
+      runtime:
+        description: app.yaml の値を上書きする場合のみ指定
+        type: string
+        required: false
+        default: ""
+      skip-tools:
+        description: 実行しないスキャンツール（切り分け用）
+        type: string
+        required: false
+        default: ""
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+    outputs:
+      gate-verdict:
+        description: passed / blocked
+        value: ${{ jobs.scan.outputs.verdict }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 設定の読み込みと検証。ここが落ちたら後続は意味をなさない
+  # ---------------------------------------------------------------------------
+  config:
+    name: 設定の検証
+    runs-on: ubuntu-latest
+    outputs:
+      service: ${{ steps.app.outputs.service }}
+      app: ${{ steps.app.outputs.app }}
+      runtime: ${{ steps.app.outputs.runtime }}
+      deploy: ${{ steps.app.outputs.deploy }}
+      terraform-dir: ${{ steps.app.outputs.terraform-dir }}
+      name-prefix: ${{ steps.app.outputs.name-prefix }}
+      is-fork: ${{ steps.fork.outputs.is-fork }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - name: フォークからのPRか判定
+        id: fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          is_fork="false"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            head_repo="$(python3 -c "import json,os; print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['pull_request']['head']['repo']['full_name'])")"
+            if [[ "${head_repo}" != "${GITHUB_REPOSITORY}" ]]; then
+              is_fork="true"
+            fi
+          fi
+          echo "is-fork=${is_fork}" >> "${GITHUB_OUTPUT}"
+          if [[ "${is_fork}" == "true" ]]; then
+            echo "::notice::フォークからのPRのため、AWSに触るジョブはスキップされます（ADR-0002）"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 静的解析・脆弱性診断。シークレットを使わないのでフォークでも実行する
+  # ---------------------------------------------------------------------------
+  scan:
+    name: 静的解析・脆弱性診断
+    needs: config
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.gate.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaksが履歴を見るため全件取得する
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: ランタイム別のセットアップ（Java）
+        if: needs.config.outputs.runtime == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Gradle Wrapper がないリポジトリでも動くようにgradleを用意する。
+      # Wrapperがある場合はそれが優先される（scan action側で判定）
+      - name: Gradleのセットアップ
+        if: needs.config.outputs.runtime == 'java'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: ランタイム別のセットアップ（Node）
+        if: needs.config.outputs.runtime == 'typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: スキャン
+        uses: moonlight4617/platform-cicd/actions/scan@v1
+        with:
+          runtime: ${{ inputs.runtime != '' && inputs.runtime || needs.config.outputs.runtime }}
+          output-dir: reports/scan
+          terraform-dir: ${{ needs.config.outputs.terraform-dir }}
+          skip-tools: ${{ inputs.skip-tools }}
+
+      - name: ゲート判定
+        id: gate
+        uses: moonlight4617/platform-cicd/actions/gate@v1
+        with:
+          sarif-dir: reports/scan
+          mode: pr
+          report-url: ${{ needs.config.outputs.is-fork == 'true' && '(フォークPRのためS3未格納)' || '(次のジョブでS3へ格納)' }}
+          # PRではCRITICALのみ停止。基準はpolicy.yamlで一元管理（ADR-0008）
+          fail-on-block: "true"
+
+      # レポートはArtifactに置かない。publicリポジトリでは誰でも
+      # ダウンロードできるため（ADR-0009）。S3のみに格納する。
+      - name: レポートを後続ジョブへ引き継ぐ
+        if: always() && needs.config.outputs.is-fork != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          # 要約のみ。SARIF本体やplan全文は含めない
+          name: gate-summary
+          path: |
+            ${{ steps.gate.outputs.summary-path }}
+            ${{ steps.gate.outputs.summary-json-path }}
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: SARIFをS3格納用に退避
+        if: always() && needs.config.outputs.is-fork != 'true'
+        shell: bash
+        run: tar -czf "${RUNNER_TEMP}/sarif.tar.gz" -C reports scan
+
+      - name: SARIFを後続ジョブへ引き継ぐ
+        if: always() && needs.config.outputs.is-fork != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-bundle
+          path: ${{ runner.temp }}/sarif.tar.gz
+          retention-days: 1
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # terraform plan。AWSに触るためフォークではスキップ（ADR-0002）
+  # ---------------------------------------------------------------------------
+  terraform:
+    name: terraform plan
+    needs: config
+    if: needs.config.outputs.is-fork != 'true'
+    runs-on: ubuntu-latest
+    # ADR-0006: すべてのAWSアクセス経路を環境で固定する
+    environment: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, stage, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - name: plan
+        id: plan
+        uses: moonlight4617/platform-cicd/actions/terraform-plan@v1
+        with:
+          terraform-dir: ${{ needs.config.outputs.terraform-dir }}
+          terraform-version: ${{ inputs.terraform-version }}
+          env: ${{ matrix.env }}
+          service: ${{ needs.config.outputs.service }}
+          app: ${{ needs.config.outputs.app }}
+          tfstate-bucket: ${{ secrets.TFSTATE_BUCKET }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # CIロールは読み取り専用のためロックを取得できない
+          lock: "false"
+          reports-dir: reports/terraform-${{ matrix.env }}
+
+      - name: plan全文をS3へ
+        uses: moonlight4617/platform-cicd/actions/upload-reports@v1
+        with:
+          bucket: ${{ secrets.REPORTS_BUCKET }}
+          source-dir: reports/terraform-${{ matrix.env }}
+          service: ${{ needs.config.outputs.service }}
+          app: ${{ needs.config.outputs.app }}
+          env: ci
+          commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          kind: reports
+
+      - name: plan要約を引き継ぐ
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-summary-${{ matrix.env }}
+          path: ${{ steps.plan.outputs.summary-path }}
+          retention-days: 1
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # レポートのS3格納とPRコメント
+  #
+  # always() にしているのは、ゲートで停止したときこそレポートが必要だから。
+  # 停止した理由を見るためにS3のレポートが要る。
+  # ---------------------------------------------------------------------------
+  report:
+    name: レポート格納とPRコメント
+    needs: [config, scan, terraform]
+    if: always() && needs.config.outputs.is-fork != 'true'
+    runs-on: ubuntu-latest
+    environment: ci
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_CI }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      - name: SARIFを展開
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/scan
+          if [[ -f artifacts/sarif-bundle/sarif.tar.gz ]]; then
+            tar -xzf artifacts/sarif-bundle/sarif.tar.gz -C reports
+            mv reports/scan/* reports/scan/ 2>/dev/null || true
+          else
+            echo "::warning::SARIFのバンドルがありません。スキャンジョブが失敗した可能性があります"
+          fi
+          ls -la reports/scan || true
+
+      - name: SARIFをS3へ
+        id: upload
+        if: hashFiles('reports/scan/**') != ''
+        uses: moonlight4617/platform-cicd/actions/upload-reports@v1
+        with:
+          bucket: ${{ secrets.REPORTS_BUCKET }}
+          source-dir: reports/scan
+          service: ${{ needs.config.outputs.service }}
+          app: ${{ needs.config.outputs.app }}
+          env: ci
+          commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          kind: reports
+
+      - name: PRコメントの本文を組み立て
+        shell: bash
+        env:
+          GATE_RESULT: ${{ needs.scan.result }}
+          TF_RESULT: ${{ needs.terraform.result }}
+          S3_URI: ${{ steps.upload.outputs.s3-uri }}
+        run: |
+          set -euo pipefail
+          body="${RUNNER_TEMP}/pr-body.md"
+
+          {
+            echo "# CI結果"
+            echo ""
+            echo "| ジョブ | 結果 |"
+            echo "|---|---|"
+            echo "| 静的解析・脆弱性診断 | ${GATE_RESULT} |"
+            echo "| terraform plan | ${TF_RESULT} |"
+            echo ""
+          } > "${body}"
+
+          if [[ -f artifacts/gate-summary/gate-summary.md ]]; then
+            cat artifacts/gate-summary/gate-summary.md >> "${body}"
+            echo "" >> "${body}"
+          fi
+
+          for env in dev stage prod; do
+            f="artifacts/plan-summary-${env}/plan-summary.md"
+            if [[ -f "${f}" ]]; then
+              cat "${f}" >> "${body}"
+              echo "" >> "${body}"
+            fi
+          done
+
+          {
+            echo "---"
+            echo ""
+            echo "レポート全文（privateなS3。閲覧にはAWSの権限が必要）:"
+            echo ""
+            echo '```'
+            echo "${S3_URI:-(未格納)}"
+            echo '```'
+          } >> "${body}"
+
+          echo "BODY_FILE=${body}" >> "${GITHUB_ENV}"
+
+      - name: PRにコメント
+        if: github.event_name == 'pull_request'
+        uses: moonlight4617/platform-cicd/actions/pr-comment@v1
+        with:
+          body-file: ${{ env.BODY_FILE }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 失敗時のSlack通知
+        if: needs.scan.result == 'failure' || needs.terraform.result == 'failure'
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: failure
+          title: "CI失敗: ${{ needs.config.outputs.name-prefix }}"
+          body: "ブランチ `${{ github.head_ref || github.ref_name }}` のCIが失敗しました。"
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

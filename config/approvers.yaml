@@ -1,0 +1,67 @@
+# 承認ゲートのペルソナ定義（ADR-0003）とSlack通知の宛先（ADR-0015）
+#
+# 承認の「判定」はGitHub Environmentsの Required reviewers が正本。
+# このファイルは次の2つに使う:
+#   1. Environments に登録すべき承認者の正（反映は手作業。ADR-0003の未解決事項）
+#   2. Slack通知時のメンション先の解決
+#
+# 実験では使えるGitHubアカウントが1個のため、全ペルソナが同一アカウントを指す。
+# 意図した承認体制はここに表現されており、実アカウントの割り当てだけを
+# 後から差し替えられる。
+
+personas:
+  dev_lead:
+    description: 開発リード。コードと変更内容の妥当性を見る
+    github: [moonlight4617]
+    slack: []            # SlackのユーザーID（例: U01ABCDEF）。未設定ならメンションなし
+
+  qa_po:
+    description: QA / プロダクトオーナー。stageでの確認結果とリリース可否を見る
+    github: [moonlight4617]   # TODO: 実アカウントに差し替え
+    slack: []
+
+  sre:
+    description: SRE / 運用。リリース時間帯、影響範囲、切り戻し手順を見る
+    github: [moonlight4617]   # TODO: 実アカウントに差し替え
+    slack: []
+
+# ---------------------------------------------------------------------------
+# ゲートの構成
+#
+# GitHub Environments の名前と、そこに登録すべきペルソナの対応。
+# prod は3段階なので、承認用の環境を3つ直列につなぐ（ADR-0003）。
+# 1つの環境に3人を登録すると「誰か1人の承認」で通ってしまうため。
+# ---------------------------------------------------------------------------
+gates:
+  ci:
+    environment: ci
+    approvers: []
+
+  dev:
+    environment: dev
+    approvers: []
+
+  stage:
+    environment: stage
+    approvers: [dev_lead]
+
+  prod:
+    environments:
+      - { name: prod-approval-1, approvers: [dev_lead] }
+      - { name: prod-approval-2, approvers: [qa_po] }
+      - { name: prod-approval-3, approvers: [sre] }
+      - { name: prod, approvers: [] }        # 3段通過後の実行用
+
+  prod_emergency:
+    environment: prod-emergency
+    approvers: [sre]
+
+# ---------------------------------------------------------------------------
+# 実験での割り切り（ADR-0003のトレードオフ）
+#
+# Environments の「自分のデプロイを自分でレビューさせない」設定はOFFにする。
+# 承認者が1アカウントのため、ONだと誰も承認できない。
+# 実務では必ずONにすること。
+# ---------------------------------------------------------------------------
+settings:
+  prevent_self_review: false   # 実務では true

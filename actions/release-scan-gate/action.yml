@@ -1,0 +1,130 @@
+name: リリース時のセキュリティゲート
+description: >
+  ADR-0008: stage / prod へのデプロイで、検査結果に問題があれば停止する（FR-15）。
+
+  CIの結果だけに頼らず、**イメージを再スキャンする。**
+  CI通過時点とリリース時点には時間差があり、その間に公表された脆弱性を
+  見逃すため。CI結果はcommit SHAに対応するS3のレポートから取得する。
+
+inputs:
+  service:
+    required: true
+  app:
+    required: true
+  env:
+    description: stage / prod。停止条件の強さが変わる
+    required: true
+  commit-sha:
+    description: CI結果を引くためのcommit SHA
+    required: true
+  image-uri:
+    description: 再スキャン対象のイメージ（digest指定）。空ならスキップ
+    required: false
+    default: ""
+  reports-bucket:
+    required: true
+  exceptions-path:
+    required: false
+    default: .platform/security-exceptions.yaml
+  fail-on-block:
+    required: false
+    default: "true"
+
+outputs:
+  verdict:
+    description: passed / blocked
+    value: ${{ steps.gate.outputs.verdict }}
+  report-dir:
+    description: 収集したSARIFのディレクトリ
+    value: ${{ steps.collect.outputs.report-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: CI結果の取得と再スキャン
+      id: collect
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.reports-bucket }}
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        IMAGE_URI: ${{ inputs.image-uri }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${BUCKET}"
+
+        dir="${RUNNER_TEMP}/release-scan"
+        mkdir -p "${dir}"
+
+        # --- CI結果の取得（ADR-0009のキー構造） ---
+        prefix="${SERVICE}/${APP:-_}/ci/${COMMIT_SHA}/"
+        latest_run="$(aws s3api list-objects-v2 \
+          --bucket "${BUCKET}" \
+          --prefix "${prefix}" \
+          --query 'Contents[?contains(Key, `/reports/`)].Key' \
+          --output text 2>/dev/null | tr '\t' '\n' | sed -n 's|^'"${prefix}"'\([^/]*\)/reports/.*|\1|p' | sort -u | tail -1 || true)"
+
+        if [[ -z "${latest_run}" ]]; then
+          # CI結果がないまま stage/prod へ出すことを許さない。
+          # 「検査していない」状態を通過として扱わないため（NFR-05）
+          echo "::error::commit ${COMMIT_SHA} のCI結果がS3に見つかりません。CIを通していない成果物はリリースできません"
+          exit 1
+        fi
+
+        aws s3 cp "s3://${BUCKET}/${prefix}${latest_run}/reports/" "${dir}/ci/" \
+          --recursive --only-show-errors --exclude "*" --include "*.sarif"
+
+        ci_count="$(find "${dir}/ci" -name '*.sarif' 2>/dev/null | wc -l)"
+        if [[ "${ci_count}" -eq 0 ]]; then
+          echo "::error::CI結果にSARIFが含まれていません（run ${latest_run}）"
+          exit 1
+        fi
+        echo "CI結果を取得しました（${ci_count} 件のSARIF、run ${latest_run}）"
+
+        # --- イメージの再スキャン ---
+        if [[ -n "${IMAGE_URI}" ]]; then
+          set -a
+          source "${GITHUB_ACTION_PATH}/../../config/tool-versions.env"
+          set +a
+
+          mkdir -p "${RUNNER_TEMP}/tools"
+          if [[ -n "${TRIVY_VERSION}" ]]; then
+            curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh" \
+              | sh -s -- -b "${RUNNER_TEMP}/tools" "v${TRIVY_VERSION}"
+          else
+            curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh" \
+              | sh -s -- -b "${RUNNER_TEMP}/tools"
+          fi
+
+          aws ecr get-login-password \
+            | docker login --username AWS --password-stdin "${IMAGE_URI%%/*}"
+
+          "${RUNNER_TEMP}/tools/trivy" image \
+            --format json \
+            --output "${RUNNER_TEMP}/trivy-image.json" \
+            --no-progress \
+            "${IMAGE_URI}"
+
+          pip install --quiet --disable-pip-version-check pyyaml
+          python3 "${GITHUB_ACTION_PATH}/../../scripts/trivy_to_sarif.py" \
+            --input "${RUNNER_TEMP}/trivy-image.json" \
+            --output "${dir}/ci/trivy-image-rescan.sarif" \
+            --tool-name trivy-image-rescan
+        else
+          echo "::warning::image-uri が未指定のため再スキャンをスキップします。CI通過後に公表された脆弱性を検出できません"
+        fi
+
+        echo "report-dir=${dir}/ci" >> "${GITHUB_OUTPUT}"
+
+    # composite action内の `./actions/gate` は呼び出し側リポジトリを参照してしまうため、
+    # 完全なリポジトリパスで指定する
+    - name: ゲート判定
+      id: gate
+      uses: moonlight4617/platform-cicd/actions/gate@v1
+      with:
+        sarif-dir: ${{ steps.collect.outputs.report-dir }}
+        mode: ${{ inputs.env }}
+        exceptions-path: ${{ inputs.exceptions-path }}
+        report-url: "s3（リリース時の再スキャン結果を含む）"
+        fail-on-block: ${{ inputs.fail-on-block }}

@@ -1,0 +1,197 @@
+# 成果物のビルド（ADR-0005）
+#
+# mainへのマージを契機に、イメージを1回だけビルドしてECRへpushする。
+# **デプロイはしない。**
+#
+# なぜデプロイしないのか（ADR-0004の補足）:
+#   devはサンドボックスであり、自動デプロイすると開発者の検証を無断で上書きする。
+#   またdevに「お試しのデプロイ」と「正規の成果物のデプロイ」が混在し、
+#   「今のdevはどちらか」という問いが常に発生する。
+#
+# 昇格チェーンは main → stage → prod。ここで作られた成果物のdigestが
+# その起点になる。
+#
+# 呼び出し側（アプリリポジトリ）:
+#
+#   name: Build artifact
+#   on:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     build:
+#       uses: moonlight4617/platform-cicd/.github/workflows/build-artifact.yml@v1
+#       secrets: inherit
+
+name: 成果物のビルド
+
+on:
+  workflow_call:
+    inputs:
+      terraform-version:
+        type: string
+        required: false
+        default: 1.16.4
+    outputs:
+      image-digest:
+        description: 成果物のdigest。stage/prodへのリリースで指定する
+        value: ${{ jobs.build.outputs.image-digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ビルドとECRへのpush
+    runs-on: ubuntu-latest
+    # ECRへのpush権限を持つのは gha-deploy-dev ロールだけであり、
+    # そのロールは environment: build / dev からのみ引き受けられる（ADR-0006）。
+    # これによりADR-0005「1回だけビルド」が権限として守られる
+    environment: build
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image-digest: ${{ steps.image.outputs.image-digest }}
+      app: ${{ steps.app.outputs.app }}
+      service: ${{ steps.app.outputs.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: app
+        uses: moonlight4617/platform-cicd/actions/app-config@v1
+
+      - name: 例外規定の確認（ADR-0005）
+        shell: bash
+        env:
+          BUILD_PER_ENV: ${{ steps.app.outputs.build-per-env }}
+        run: |
+          set -euo pipefail
+          if [[ "${BUILD_PER_ENV}" == "true" ]]; then
+            echo "::error::build_per_env: true のアプリは、このワークフローでは扱えません。環境別ビルドの経路を使ってください（ADR-0005の例外規定）"
+            exit 1
+          fi
+          echo "環境に依存しない成果物を1つだけビルドします"
+
+      - name: ランタイム別のセットアップ（Java）
+        if: steps.app.outputs.runtime == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Gradleのセットアップ
+        if: steps.app.outputs.runtime == 'java'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: ランタイム別のセットアップ（Node）
+        if: steps.app.outputs.runtime == 'typescript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: アプリのビルド
+        shell: bash
+        env:
+          RUNTIME: ${{ steps.app.outputs.runtime }}
+        run: |
+          set -euo pipefail
+          case "${RUNTIME}" in
+            java)
+              if [[ -x ./gradlew ]]; then
+                ./gradlew --no-daemon --console=plain build
+              else
+                echo "::warning file=gradlew::Gradle Wrapper がありません。環境のgradleを使います"
+                gradle --no-daemon --console=plain build
+              fi
+              ;;
+            typescript)
+              npm ci
+              npm run build --if-present
+              ;;
+            python)
+              echo "Pythonは依存の取得をデプロイ側で行うため、ここではビルドしません"
+              ;;
+            *)
+              echo "::error::未対応のruntime: ${RUNTIME}"
+              exit 1
+              ;;
+          esac
+
+      - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          mask-extra: ${{ secrets.ARTIFACTS_BUCKET }},${{ secrets.REPORTS_BUCKET }}
+
+      # --- ECS: コンテナイメージ ---
+      - name: イメージのビルドとpush
+        id: image
+        if: steps.app.outputs.deploy == 'ecs'
+        uses: moonlight4617/platform-cicd/actions/build-image@v1
+        with:
+          ecr-repository: ${{ steps.app.outputs.ecr-repository }}
+          image-tag: ${{ github.sha }}
+
+      # --- Lambda: zip ---
+      - name: zipの作成とアップロード
+        id: zip
+        if: steps.app.outputs.deploy == 'lambda'
+        shell: bash
+        env:
+          BUCKET: ${{ secrets.ARTIFACTS_BUCKET }}
+          NAME_PREFIX: ${{ steps.app.outputs.name-prefix }}
+          SERVICE: ${{ steps.app.outputs.service }}
+          APP: ${{ steps.app.outputs.app }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${BUCKET}"
+
+          zip_path="${RUNNER_TEMP}/${GITHUB_SHA}.zip"
+          # 依存を含めてパッケージする。環境別の値は含めない（ADR-0005）
+          if [[ -f requirements.txt ]]; then
+            pip install --quiet --target "${RUNNER_TEMP}/package" -r requirements.txt
+            (cd "${RUNNER_TEMP}/package" && zip -qr "${zip_path}" .)
+          fi
+          zip -qr "${zip_path}" src -x '*__pycache__*'
+
+          key="${SERVICE}/${APP}/${GITHUB_SHA}.zip"
+          aws s3 cp "${zip_path}" "s3://${BUCKET}/${key}" --only-show-errors
+
+          # Lambdaの成果物はdigestの代わりにzipのSHA256で同一性を見る
+          hash="$(sha256sum "${zip_path}" | cut -d' ' -f1)"
+          echo "artifact-hash=sha256:${hash}" >> "${GITHUB_OUTPUT}"
+          echo "成果物のhash: sha256:${hash}"
+
+      - name: 成果物の記録
+        uses: moonlight4617/platform-cicd/actions/release-record@v1
+        with:
+          kind: build
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          commit-sha: ${{ github.sha }}
+          image-digest: ${{ steps.image.outputs.image-digest || steps.zip.outputs.artifact-hash }}
+          image-tag: ${{ github.sha }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 完了の通知
+        if: always()
+        uses: moonlight4617/platform-cicd/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          title: "成果物のビルド${{ job.status == 'success' && '完了' || '失敗' }}: ${{ steps.app.outputs.name-prefix }}"
+          body: >-
+            commit `${{ github.sha }}` の成果物を作成しました。
+            stage へのリリースは Release ワークフローを手動実行してください。
+          link-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          link-text: 実行ログを開く

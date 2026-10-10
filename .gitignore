@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ローカル実行時の出力
+reports/
+local/

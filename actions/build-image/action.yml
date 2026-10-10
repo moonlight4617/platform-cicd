@@ -1,0 +1,113 @@
+name: イメージのビルドとECRへのpush
+description: >
+  ADR-0005: ビルドは1回だけ行い、同一の成果物を昇格させる。
+
+  このactionを実行できるのは、ECRへのpush権限を持つロール（gha-deploy-dev）を
+  引き受けたジョブだけである。stage/prodのロールは読み取りのみなので、
+  **環境別ビルドが権限として不可能**になっている。
+
+  出力するdigestが成果物の識別子になる。タグは後から付け替えられるため、
+  デプロイ時はタグではなくdigestで指定する。
+
+inputs:
+  ecr-repository:
+    description: ECRリポジトリ名（<service>-<app>）
+    required: true
+  image-tag:
+    description: イメージタグ。commit SHAを指定する
+    required: true
+  context:
+    description: docker buildのコンテキスト
+    required: false
+    default: "."
+  dockerfile:
+    description: Dockerfileのパス
+    required: false
+    default: Dockerfile
+  build-args:
+    description: docker buildに渡す --build-arg（改行区切りの KEY=VALUE）
+    required: false
+    default: ""
+
+outputs:
+  image-digest:
+    description: "sha256:... 形式のdigest。成果物の識別子"
+    value: ${{ steps.push.outputs.image-digest }}
+  image-uri:
+    description: digestで固定したイメージURI
+    value: ${{ steps.push.outputs.image-uri }}
+
+runs:
+  using: composite
+  steps:
+    - name: ECRへログイン
+      id: login
+      shell: bash
+      run: |
+        set -euo pipefail
+        registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$(aws configure get region 2>/dev/null || echo "${AWS_REGION}").amazonaws.com"
+        # レジストリURLにはアカウントIDが含まれる（ADR-0002）
+        echo "::add-mask::${registry}"
+        aws ecr get-login-password | docker login --username AWS --password-stdin "${registry}"
+        echo "registry=${registry}" >> "${GITHUB_OUTPUT}"
+
+    - name: ビルドとpush
+      id: push
+      shell: bash
+      env:
+        REGISTRY: ${{ steps.login.outputs.registry }}
+        REPO: ${{ inputs.ecr-repository }}
+        TAG: ${{ inputs.image-tag }}
+        CONTEXT: ${{ inputs.context }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+      run: |
+        set -euo pipefail
+
+        image="${REGISTRY}/${REPO}:${TAG}"
+        echo "::add-mask::${image}"
+
+        args=(build -f "${DOCKERFILE}" -t "${image}")
+
+        # ADR-0005: 環境を識別する値を --build-arg で渡してはいけない。
+        # イメージが環境に依存すると、同一成果物の昇格ができなくなる
+        if [[ -n "${BUILD_ARGS}" ]]; then
+          while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            key="${line%%=*}"
+            case "${key,,}" in
+              *env*|*profile*|*stage*|*prod*)
+                echo "::error::build-args に環境を示す値を渡せません: ${key}（ADR-0005）"
+                exit 1
+                ;;
+            esac
+            args+=(--build-arg "${line}")
+          done <<< "${BUILD_ARGS}"
+        fi
+
+        args+=("${CONTEXT}")
+        docker "${args[@]}"
+        docker push "${image}"
+
+        # push後にdigestを取得する。これが成果物の識別子になる
+        digest="$(aws ecr describe-images \
+          --repository-name "${REPO}" \
+          --image-ids "imageTag=${TAG}" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text)"
+
+        if [[ -z "${digest}" || "${digest}" == "None" ]]; then
+          echo "::error::pushしたイメージのdigestを取得できませんでした"
+          exit 1
+        fi
+
+        uri="${REGISTRY}/${REPO}@${digest}"
+        echo "::add-mask::${uri}"
+
+        {
+          echo "image-digest=${digest}"
+          echo "image-uri=${uri}"
+        } >> "${GITHUB_OUTPUT}"
+
+        # digestはアカウントIDを含まないため表示してよい
+        echo "成果物のdigest: ${digest}"

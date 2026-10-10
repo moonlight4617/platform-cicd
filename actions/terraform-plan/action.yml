@@ -1,0 +1,182 @@
+name: terraform plan
+description: >
+  planを実行し、要約と全文を出力する（ADR-0007, ADR-0009）。
+
+  CIのplanは必ず -lock=false で実行する。stateのロックにS3ネイティブロックを
+  使っており、ロック取得にはS3への書き込みが必要だが、CIロールは読み取り専用のため。
+  planは状態を変更しないのでロックなしで問題ない。
+
+  plan全文はPRコメントに載せない。S3に置いて要約だけを返す（ADR-0002）。
+
+inputs:
+  terraform-dir:
+    description: Terraformのディレクトリ
+    required: false
+    default: terraform
+  terraform-version:
+    description: >
+      使用するTerraformのバージョン。
+      S3ネイティブロック（use_lockfile）のため 1.10 以上が必要。
+    required: false
+    default: 1.16.4
+  env:
+    description: dev / stage / prod
+    required: true
+  service:
+    description: サービス名
+    required: true
+  app:
+    description: アプリ名。infraリポジトリでは空
+    required: false
+    default: ""
+  tfstate-bucket:
+    description: state用S3バケット名。GitHub Secretsから渡す
+    required: true
+  aws-region:
+    description: AWSリージョン
+    required: true
+  lock:
+    description: ロックを取得するか。CIのplanでは false
+    required: false
+    default: "false"
+  refresh-only:
+    description: ドリフト検知用。-refresh-only で実行する
+    required: false
+    default: "false"
+  reports-dir:
+    description: plan全文の出力先。S3へアップロードされる
+    required: false
+    default: reports/terraform
+  var-file:
+    description: 追加で読み込むtfvarsファイル
+    required: false
+    default: ""
+  extra-args:
+    description: planに渡す追加の引数
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: "0=差分なし / 2=差分あり（-detailed-exitcode）"
+    value: ${{ steps.plan.outputs.exit-code }}
+  has-changes:
+    description: 差分があるか（true / false）
+    value: ${{ steps.plan.outputs.has-changes }}
+  summary-path:
+    description: 要約（Markdown）のパス
+    value: ${{ steps.plan.outputs.summary-path }}
+  add:
+    description: 追加されるリソース数
+    value: ${{ steps.plan.outputs.add }}
+  change:
+    description: 変更されるリソース数
+    value: ${{ steps.plan.outputs.change }}
+  destroy:
+    description: 削除されるリソース数
+    value: ${{ steps.plan.outputs.destroy }}
+
+runs:
+  using: composite
+  steps:
+    - name: Terraformの用意
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: init
+      shell: bash
+      working-directory: ${{ inputs.terraform-dir }}
+      env:
+        TFSTATE_BUCKET: ${{ inputs.tfstate-bucket }}
+        AWS_REGION_INPUT: ${{ inputs.aws-region }}
+        SERVICE: ${{ inputs.service }}
+        APP: ${{ inputs.app }}
+        ENV_NAME: ${{ inputs.env }}
+      run: |
+        set -euo pipefail
+
+        # ADR-0002: バケット名はコードに書かずSecretsから渡す
+        echo "::add-mask::${TFSTATE_BUCKET}"
+
+        # ADR-0007のキー構造: <service>/<app>/<env>/terraform.tfstate
+        # infraリポジトリは app を持たないため _infra を使う。
+        # IAMポリシーが */*/<env>/* で絞っているため、3階層は必須
+        app_part="${APP:-_infra}"
+        state_key="${SERVICE}/${app_part}/${ENV_NAME}/terraform.tfstate"
+        echo "TF_STATE_KEY=${state_key}" >> "${GITHUB_ENV}"
+
+        terraform init \
+          -input=false \
+          -no-color \
+          -backend-config="bucket=${TFSTATE_BUCKET}" \
+          -backend-config="key=${state_key}" \
+          -backend-config="region=${AWS_REGION_INPUT}"
+
+    - name: plan
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.terraform-dir }}
+      env:
+        ENV_NAME: ${{ inputs.env }}
+        LOCK: ${{ inputs.lock }}
+        REFRESH_ONLY: ${{ inputs.refresh-only }}
+        VAR_FILE: ${{ inputs.var-file }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+        REPORTS_DIR: ${{ inputs.reports-dir }}
+      run: |
+        set -uo pipefail
+
+        args=(-input=false -no-color -detailed-exitcode -out=tfplan)
+        args+=("-lock=${LOCK}")
+
+        if [[ "${REFRESH_ONLY}" == "true" ]]; then
+          args+=(-refresh-only)
+        fi
+
+        # 環境ごとの差分はtfvarsで表現する（workspaceは使わない。ADR-0007）
+        if [[ -f "env/${ENV_NAME}.tfvars" ]]; then
+          args+=("-var-file=env/${ENV_NAME}.tfvars")
+        fi
+        if [[ -n "${VAR_FILE}" ]]; then
+          args+=("-var-file=${VAR_FILE}")
+        fi
+        if [[ -n "${EXTRA_ARGS}" ]]; then
+          # shellcheck disable=SC2206
+          args+=(${EXTRA_ARGS})
+        fi
+
+        set +e
+        terraform plan "${args[@]}"
+        exit_code=$?
+        set -e
+
+        # -detailed-exitcode: 0=差分なし, 1=エラー, 2=差分あり
+        if [[ ${exit_code} -eq 1 ]]; then
+          echo "::error::terraform plan が失敗しました"
+          exit 1
+        fi
+
+        has_changes="false"
+        [[ ${exit_code} -eq 2 ]] && has_changes="true"
+
+        # 全文はS3へ。PRコメントには載せない（ADR-0002, ADR-0009）
+        mkdir -p "${GITHUB_WORKSPACE}/${REPORTS_DIR}"
+        terraform show -no-color tfplan > "${GITHUB_WORKSPACE}/${REPORTS_DIR}/plan.txt"
+        terraform show -json tfplan > "${GITHUB_WORKSPACE}/${REPORTS_DIR}/plan.json"
+
+        summary="${RUNNER_TEMP}/plan-summary.md"
+        python3 "${GITHUB_ACTION_PATH}/../../scripts/summarize_plan.py" \
+          --plan-json "${GITHUB_WORKSPACE}/${REPORTS_DIR}/plan.json" \
+          --env "${ENV_NAME}" \
+          --out "${summary}" \
+          --github-output "${GITHUB_OUTPUT}"
+
+        {
+          echo "exit-code=${exit_code}"
+          echo "has-changes=${has_changes}"
+          echo "summary-path=${summary}"
+        } >> "${GITHUB_OUTPUT}"
+
+        cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
