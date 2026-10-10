@@ -184,6 +184,13 @@ jobs:
     runs-on: ubuntu-latest
     # ADR-0006: すべてのAWSアクセス経路を環境で固定する
     environment: ci
+    # 再利用可能ワークフローのワークフローレベル permissions（contents: read）が
+    # GITHUB_TOKENの上限になるため、OIDCを使うジョブでは id-token: write を
+    # ジョブレベルで明示する必要がある。
+    # 無いと「Could not load credentials from any providers」で失敗する
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
