@@ -832,12 +832,49 @@ Incoming Webhookのみ。**通知は一方向で、承認操作はSlackから行
 | 未報告の緊急リリースがあると通常リリースが止まる | `test_release_store.py` |
 | 緊急リリース経路は未報告があっても使える | `test_release_store.py` |
 
+### 実機検証で判明した問題（15章）
+
+設計・コードレビュー・ローカルテストでは検出できず、**実際に動かしてはじめて
+判明した問題が5件**ある。詳細は15章。
+
 ### 未検証の重要項目
 
 | 内容 | 理由 |
 |---|---|
-| CI/CDの実AWSに対する動作 | `platform-infra` が未apply |
-| 承認ゲートの実動作 | GitHub Environmentsの設定が未実施 |
-| Gradleビルド | ローカルにJava/Gradleがなく、Dockerデーモンも停止 |
-| IAMポリシーの網羅性 | 実際のapplyでのみ検証できる（既に3箇所の穴を発見済み） |
+| 承認ゲートの実動作 | stage/prodへのリリースを未実行 |
+| ECSへの実デプロイ | CIが通るまで未実行 |
 | Slack通知の実配信 | Webhook URLが未設定 |
+
+---
+
+## 15. 実機検証で判明した問題
+
+**この基盤は、実際に動かさずに正しさを主張できない。** 以下はすべて
+`terraform validate`・YAML構文チェック・ユニットテストを通過したうえで、
+実行時に失敗したものである。
+
+| # | 問題 | 検出された場所 | 原因 |
+|---|---|---|---|
+| 1 | IAMのリソースパターンが実際のリソース名に一致しない | appAのTerraform作成時 | `*-<env>-*` は `/ecs/serviceA-appA-dev` のように環境名で終わる名前に一致しない。ロググループ・タスク定義・Lambda関数の3箇所 |
+| 2 | ECRのリポジトリ名は小文字のみ | `platform-infra` のapply | 命名規約 `<service>-<app>` は `serviceA-appA` のように大文字を含む |
+| 3 | 再利用可能ワークフローでOIDCが使えない | CIの初回実行 | ワークフローレベルの `permissions: contents: read` がGITHUB_TOKENの上限になる。OIDCを使うジョブに `id-token: write` をジョブレベルで明示する必要がある |
+| 4 | SpotBugs 6.xでタスクの生成に失敗 | CIのスキャンジョブ | 既定のレポートが登録されていないため `reports.named("xml")` の参照で `SpotBugsReport with name 'xml' not found` |
+| 5 | Spring Boot 4でテストのパッケージが移動 | ビルド | `AutoConfigureMockMvc` が `org.springframework.boot.test.autoconfigure.web.servlet` に存在しない |
+
+### 構造的に予見できた問題
+
+次の1件は設計から導けたもので、実機検証の前に自分で気づいて対処した。
+
+| 問題 | 内容 |
+|---|---|
+| `image_digest` のvalidationがCIのplanを壊す | stage/prodで `image_digest` を必須にすると（ADR-0005をvalidationで強制）、デプロイではないCIのplanが通らない。DynamoDBから「その環境にデプロイされている成果物のdigest」を引いて渡すことで解決した。固定のダミー値だとplanに毎回差分が出てレビュー価値が落ちる |
+
+### この結果から言えること
+
+- **IAMの名前パターンとタグ条件は、実際のリソース名を決めてapplyするまで検証できない。**
+  1アカウント構成（ADR-0006）で分離の強度がIAMポリシーの正しさに依存している以上、
+  実機検証は省略できない。
+- **再利用可能ワークフローのpermissionsの挙動は、実行するまで分からない。**
+  ジョブ単位で `id-token: write` を明示する規約を基盤側に持つ必要がある。
+- ツールやライブラリのバージョンは、存在確認だけでは不十分で、
+  実際にビルドして初めてAPIの差異が分かる。

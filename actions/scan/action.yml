@@ -107,9 +107,26 @@ runs:
       shell: bash
       env:
         OUT: ${{ inputs.output-dir }}
+        RUNTIME: ${{ inputs.runtime }}
+        IMAGE_REF: ${{ inputs.image-ref }}
       run: |
         set -euo pipefail
         mkdir -p "${OUT}"
+
+        # 重要な制約:
+        #   trivy fs はロックファイル（gradle.lockfile / package-lock.json /
+        #   requirements.txt など）を見て依存関係を解決する。
+        #   Gradleでロックファイルを使っていない場合、依存ライブラリは
+        #   **1件もスキャンされない**。「検出0件」が「脆弱性なし」に見えてしまう。
+        #
+        #   そのためJavaアプリでは、ビルド成果物を含むコンテナイメージの
+        #   スキャン（image-ref）を必須とする。
+        if [[ "${RUNTIME}" == "java" ]] && [[ -z "${IMAGE_REF}" ]] \
+           && [[ ! -f gradle.lockfile ]] && [[ ! -f gradle/dependency-locks/compileClasspath.lockfile ]]; then
+          echo "::error::Javaアプリでは、ロックファイルかコンテナイメージのどちらかが必要です。"
+          echo "::error::どちらも無いと依存ライブラリがスキャンされず、検出0件が「安全」に見えてしまいます（NFR-05）"
+          exit 1
+        fi
         # SARIFではなくJSONで取得する。組み込みSARIFは FixedVersion を
         # 構造化して残さず、ADR-0008のゲート基準を判定できないため
         trivy fs \
@@ -135,10 +152,12 @@ runs:
           echo "${TF_DIR} が存在しないためIaCスキャンをスキップします"
           exit 0
         fi
+        # trivy config は --no-progress を受け付けない（fs / image とは異なる）。
+        # グローバルフラグの --quiet を使う
         trivy config \
           --format json \
           --output "${RUNNER_TEMP}/trivy-config.json" \
-          --no-progress \
+          --quiet \
           "${TF_DIR}"
         python3 "${GITHUB_ACTION_PATH}/../../scripts/trivy_to_sarif.py" \
           --input "${RUNNER_TEMP}/trivy-config.json" \

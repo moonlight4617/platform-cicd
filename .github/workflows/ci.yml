@@ -128,12 +128,55 @@ jobs:
           node-version: "22"
           cache: npm
 
+      # テストを含むビルドを行う。
+      # 成果物を作る目的ではなく、
+      #   1. テストが通ることの確認
+      #   2. スキャン対象のイメージを作ること
+      # が目的。ECRへはpushしない（pushできるのはdevロールのみ。ADR-0005）
+      - name: ビルドとテスト
+        shell: bash
+        env:
+          RUNTIME: ${{ needs.config.outputs.runtime }}
+        run: |
+          set -euo pipefail
+          case "${RUNTIME}" in
+            java)
+              if [[ -x ./gradlew ]]; then ./gradlew --no-daemon --console=plain build
+              else gradle --no-daemon --console=plain build; fi
+              ;;
+            typescript)
+              npm ci
+              npm run build --if-present
+              npm test --if-present
+              ;;
+            python)
+              if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
+              if [[ -f requirements-dev.txt ]]; then pip install -r requirements-dev.txt; fi
+              if compgen -G "tests/*" > /dev/null; then python -m pytest -q || exit 1; fi
+              ;;
+            none) echo "ビルド対象なし" ;;
+          esac
+
+      # 依存ライブラリを実際にスキャンするためにイメージを作る。
+      # trivy fs はロックファイルが無いと依存を解決できず、
+      # Javaでは「検出0件」が「脆弱性なし」に見えてしまう（NFR-05）
+      - name: スキャン用イメージのビルド（pushしない）
+        id: scan-image
+        if: needs.config.outputs.deploy == 'ecs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="ci-scan:${GITHUB_SHA}"
+          docker build -t "${ref}" .
+          echo "image-ref=${ref}" >> "${GITHUB_OUTPUT}"
+
       - name: スキャン
         uses: moonlight4617/platform-cicd/actions/scan@v1
         with:
           runtime: ${{ inputs.runtime != '' && inputs.runtime || needs.config.outputs.runtime }}
           output-dir: reports/scan
           terraform-dir: ${{ needs.config.outputs.terraform-dir }}
+          image-ref: ${{ steps.scan-image.outputs.image-ref }}
           skip-tools: ${{ inputs.skip-tools }}
 
       - name: ゲート判定
