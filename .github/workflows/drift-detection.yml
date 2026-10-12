@@ -90,11 +90,44 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
           mask-extra: ${{ secrets.TFSTATE_BUCKET }},${{ secrets.REPORTS_BUCKET }}
 
+      # デプロイ実績の確認と、planに渡すdigestの決定。
+      #
+      # 未デプロイの環境に対するドリフト検知は意味がない
+      # （比較対象の実態が存在せず、plan上は「全部作成」になるだけ）。
+      # そのためデプロイ実績がなければスキップする。
+      - name: デプロイ実績の確認
+        id: digest
+        if: steps.target.outputs.skip != 'true'
+        uses: moonlight4617/platform-cicd/actions/plan-digest@v1
+        with:
+          service: ${{ steps.app.outputs.service }}
+          app: ${{ steps.app.outputs.app }}
+          env: ${{ matrix.env }}
+          releases-table: ${{ secrets.RELEASES_TABLE }}
+          tickets-table: ${{ secrets.TICKETS_TABLE }}
+          approval-audit-table: ${{ secrets.APPROVAL_AUDIT_TABLE }}
+
+      - name: 未デプロイ環境のスキップ
+        id: deployed
+        if: steps.target.outputs.skip != 'true'
+        shell: bash
+        env:
+          DEPLOYED: ${{ steps.digest.outputs.deployed }}
+          ENV_NAME: ${{ matrix.env }}
+        run: |
+          set -euo pipefail
+          if [[ "${DEPLOYED}" != "true" ]]; then
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${ENV_NAME} にはまだデプロイされていないため、ドリフト検知をスキップします"
+          else
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          fi
+
       # -refresh-only で「コードの変更」ではなく「実態の乖離」だけを見る。
       # CIロールは読み取り専用のため -lock=false
       - name: plan（refresh-only）
         id: plan
-        if: steps.target.outputs.skip != 'true'
+        if: steps.deployed.outputs.run == 'true'
         uses: moonlight4617/platform-cicd/actions/terraform-plan@v1
         with:
           terraform-dir: ${{ steps.app.outputs.terraform-dir }}
@@ -107,9 +140,10 @@ jobs:
           lock: "false"
           refresh-only: "true"
           reports-dir: reports/drift-${{ matrix.env }}
+          extra-args: ${{ steps.digest.outputs.var-arg }}
 
       - name: plan結果をS3へ
-        if: steps.target.outputs.skip != 'true'
+        if: steps.deployed.outputs.run == 'true'
         uses: moonlight4617/platform-cicd/actions/upload-reports@v1
         with:
           bucket: ${{ secrets.REPORTS_BUCKET }}
@@ -124,7 +158,7 @@ jobs:
       # Slack通知のみでは流れて消え、対応の記録と担当の割り当てができない
       - name: Issueの作成または更新
         id: issue
-        if: steps.target.outputs.skip != 'true' && steps.plan.outputs.has-changes == 'true'
+        if: steps.deployed.outputs.run == 'true' && steps.plan.outputs.has-changes == 'true'
         uses: moonlight4617/platform-cicd/actions/drift-issue@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -135,7 +169,7 @@ jobs:
           destroy: ${{ steps.plan.outputs.destroy }}
 
       - name: Slack通知
-        if: steps.target.outputs.skip != 'true' && steps.plan.outputs.has-changes == 'true'
+        if: steps.deployed.outputs.run == 'true' && steps.plan.outputs.has-changes == 'true'
         uses: moonlight4617/platform-cicd/actions/notify-slack@v1
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}

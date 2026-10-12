@@ -33,6 +33,12 @@ outputs:
   var-arg:
     description: "terraform planに渡す引数（-var=image_digest=... または空）"
     value: ${{ steps.resolve.outputs.var-arg }}
+  deployed:
+    description: >
+      その環境にデプロイされた実績があるか（true / false）。
+      ドリフト検知は「デプロイ済みの環境」にしか意味がないため、
+      false の場合は検知をスキップする判断に使う。
+    value: ${{ steps.resolve.outputs.deployed }}
 
 runs:
   using: composite

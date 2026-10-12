@@ -402,16 +402,20 @@ def cmd_digest_for_plan(args: argparse.Namespace) -> int:
 
     digest = ""
     source = "none"
+    deployed = False
 
     for item in records:
         if (
             item.get("kind") == "deploy"
             and item.get("env") == args.env
             and item.get("result") == "success"
-            and item.get("image_digest")
         ):
-            digest = str(item["image_digest"])
-            source = f"{args.env} にデプロイ済みの成果物"
+            # その環境にデプロイされたことがあるか。
+            # ドリフト検知は「デプロイ済みの環境」にしか意味がない
+            deployed = True
+            if item.get("image_digest"):
+                digest = str(item["image_digest"])
+                source = f"{args.env} にデプロイ済みの成果物"
             break
 
     if not digest:
@@ -432,8 +436,10 @@ def cmd_digest_for_plan(args: argparse.Namespace) -> int:
         with open(args.github_output, "a", encoding="utf-8") as fh:
             fh.write(f"image-digest={digest}\n")
             fh.write(f"var-arg={var_arg}\n")
+            fh.write(f"deployed={'true' if deployed else 'false'}\n")
 
     sys.stdout.write(f"planに渡すdigest: {digest or '(なし)'} / 根拠: {source}\n")
+    sys.stdout.write(f"{args.env} へのデプロイ実績: {'あり' if deployed else 'なし'}\n")
     return 0
 
 
