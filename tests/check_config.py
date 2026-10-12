@@ -68,6 +68,34 @@ def check_policy(errors: list[str]) -> None:
             "抑制の恒久化を防ぐ目的に反します"
         )
 
+    # 恒久例外の枠（ADR-0008の補足）。
+    # adr を必須にしていないと、根拠のない恒久例外を登録できてしまう
+    perm = policy.get("permanent_exceptions")
+    if not perm:
+        errors.append("policy.yaml に permanent_exceptions がありません")
+        return
+
+    for key in ("required_fields", "max_review_cycle_days", "adr_pattern"):
+        if key not in perm:
+            errors.append(f"policy.yaml の permanent_exceptions に {key} がありません")
+
+    required_perm = perm.get("required_fields") or []
+    for key in ("id", "reason", "adr", "approved_by", "last_reviewed", "review_cycle_days"):
+        if key not in required_perm:
+            errors.append(
+                f"policy.yaml の permanent_exceptions.required_fields に {key} がありません。"
+                "これが欠けると根拠や見直し周期のない恒久例外を登録できてしまいます"
+            )
+
+    cycle = perm.get("max_review_cycle_days")
+    if not isinstance(cycle, int) or cycle <= 0:
+        errors.append("policy.yaml の permanent_exceptions.max_review_cycle_days が正の整数ではありません")
+    elif cycle > 730:
+        errors.append(
+            f"policy.yaml の permanent_exceptions.max_review_cycle_days が長すぎます（{cycle}日）。"
+            "見直しが実質的に行われなくなります"
+        )
+
 
 def check_approvers(errors: list[str]) -> None:
     path = ROOT / "config" / "approvers.yaml"

@@ -1,0 +1,44 @@
+# テスト用。恒久例外の各ケースを1件ずつ含む（基準日: 2026-10-12）
+
+exceptions: []
+
+permanent:
+  # 1. 有効な恒久例外。CVE-2025-44444 が除外されるはず
+  - id: CVE-2025-44444
+    reason: 意図した設計判断である
+    adr: ADR-0001
+    approved_by: sre
+    last_reviewed: 2026-09-01
+    review_cycle_days: 180
+
+  # 2. adr がない。根拠のない恒久例外は登録できない → 停止条件
+  - id: CVE-2025-33333
+    reason: とりあえず無視したい
+    approved_by: sre
+    last_reviewed: 2026-09-01
+    review_cycle_days: 180
+
+  # 3. adr の形式が不正 → 停止条件
+  - id: java.lang.best-practice.unused-variable
+    reason: 形式が不正な根拠
+    adr: たぶんどこかに書いた
+    approved_by: sre
+    last_reviewed: 2026-09-01
+    review_cycle_days: 180
+
+  # 4. 見直し周期が上限（365日）を超える → 停止条件
+  - id: SECRET-dummy
+    reason: 実質的に恒久化させたい
+    adr: ADR-0002
+    approved_by: sre
+    last_reviewed: 2026-09-01
+    review_cycle_days: 3650
+
+  # 5. 見直し期限を超過している → 警告のみ（停止しない）。
+  #    CVE-2025-22222 は除外されたまま
+  - id: CVE-2025-22222
+    reason: 見直しが滞っている恒久例外
+    adr: ADR-0005
+    approved_by: sre
+    last_reviewed: 2026-01-01
+    review_cycle_days: 30

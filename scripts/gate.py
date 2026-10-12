@@ -22,6 +22,7 @@ import datetime as dt
 import glob
 import json
 import os
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field, asdict
@@ -61,10 +62,21 @@ class ExceptionIssue:
 
 
 @dataclass
+class ReviewNotice:
+    """恒久例外の見直し期限超過。警告であり停止条件ではない."""
+
+    exception_id: str
+    adr: str
+    last_reviewed: str
+    overdue_days: int
+
+
+@dataclass
 class Result:
     mode: str
     findings: list[Finding] = field(default_factory=list)
     exception_issues: list[ExceptionIssue] = field(default_factory=list)
+    review_notices: list[ReviewNotice] = field(default_factory=list)
     tools_seen: list[str] = field(default_factory=list)
 
 
@@ -204,22 +216,149 @@ def load_sarif(sarif_dir: str, policy: dict[str, Any]) -> tuple[list[Finding], l
 # ---------------------------------------------------------------------------
 
 
+def _parse_date(value: Any) -> dt.date | None:
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return dt.date.fromisoformat(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def load_permanent_exceptions(
+    doc: dict[str, Any], policy: dict[str, Any], today: dt.date
+) -> tuple[dict[str, dict[str, Any]], list[ExceptionIssue], list[ReviewNotice]]:
+    """恒久例外を読む（ADR-0008の補足）.
+
+    期限ではなく「見直し周期」で管理する。見直し期限を超えても
+    **停止させない**（警告のみ）。恒久的な設計判断を期限付きで表現すると、
+    儀式的な更新か、失効による突然のCI停止のどちらかになるため。
+
+    乱用を防ぐため adr フィールドを必須とし、判断の根拠となる記録への
+    リンクがないものは記載不備として停止条件にする。
+    """
+    issues: list[ExceptionIssue] = []
+    notices: list[ReviewNotice] = []
+    valid: dict[str, dict[str, Any]] = {}
+
+    config = policy.get("permanent_exceptions")
+    entries = doc.get("permanent") or []
+
+    if not entries:
+        return valid, issues, notices
+
+    if not config:
+        issues.append(
+            ExceptionIssue(
+                "malformed_exception",
+                "permanent",
+                "policy.yaml に permanent_exceptions の定義がないため、恒久例外は使えません",
+            )
+        )
+        return valid, issues, notices
+
+    required = config["required_fields"]
+    max_cycle = int(config["max_review_cycle_days"])
+    adr_pattern = re.compile(config["adr_pattern"])
+
+    for i, item in enumerate(entries):
+        if not isinstance(item, dict):
+            issues.append(ExceptionIssue("malformed_exception", f"permanent#{i}", "項目がマップ形式ではない"))
+            continue
+
+        ident = str(item.get("id") or f"permanent#{i}")
+        missing = [k for k in required if not item.get(k)]
+        if missing:
+            issues.append(
+                ExceptionIssue("malformed_exception", ident, f"必須項目が不足: {', '.join(missing)}")
+            )
+            continue
+
+        # 根拠のない恒久例外を作れないようにする
+        adr = str(item["adr"]).strip()
+        if not adr_pattern.match(adr):
+            issues.append(
+                ExceptionIssue(
+                    "malformed_exception",
+                    ident,
+                    f"adr の形式が不正: '{adr}'。判断の根拠となるADR番号（例 ADR-0001）が必要です",
+                )
+            )
+            continue
+
+        last_reviewed = _parse_date(item["last_reviewed"])
+        if last_reviewed is None:
+            issues.append(
+                ExceptionIssue("malformed_exception", ident, f"last_reviewed の日付形式が不正: {item['last_reviewed']}")
+            )
+            continue
+        if last_reviewed > today:
+            issues.append(
+                ExceptionIssue("malformed_exception", ident, f"last_reviewed が未来の日付です: {last_reviewed}")
+            )
+            continue
+
+        try:
+            cycle = int(item["review_cycle_days"])
+        except (TypeError, ValueError):
+            issues.append(ExceptionIssue("malformed_exception", ident, "review_cycle_days が整数ではない"))
+            continue
+
+        if cycle <= 0 or cycle > max_cycle:
+            issues.append(
+                ExceptionIssue(
+                    "malformed_exception",
+                    ident,
+                    f"review_cycle_days が範囲外（1〜{max_cycle}日）: {cycle}",
+                )
+            )
+            continue
+
+        valid[ident] = item
+
+        overdue = (today - last_reviewed).days - cycle
+        if overdue > 0:
+            # 停止させない。警告を出し続けることで見直しを促す
+            notices.append(
+                ReviewNotice(
+                    exception_id=ident,
+                    adr=adr,
+                    last_reviewed=last_reviewed.isoformat(),
+                    overdue_days=overdue,
+                )
+            )
+
+    return valid, issues, notices
+
+
 def load_exceptions(
     path: str | None, policy: dict[str, Any], today: dt.date
-) -> tuple[dict[str, dict[str, Any]], list[ExceptionIssue]]:
+) -> tuple[dict[str, dict[str, Any]], list[ExceptionIssue], list[ReviewNotice]]:
     """抑制を読み、不備・期限切れを洗い出す.
 
     期限切れと記載不備はそれ自体がゲートの停止条件（ADR-0008）。
     抑制が一時的な対応のまま恒久化するのを防ぐため。
+
+    恒久例外（permanent）は別の規則で扱う。load_permanent_exceptions を参照。
     """
     issues: list[ExceptionIssue] = []
+    notices: list[ReviewNotice] = []
     valid: dict[str, dict[str, Any]] = {}
 
     if not path or not os.path.exists(path):
-        return valid, issues
+        return valid, issues, notices
 
     with open(path, encoding="utf-8") as fh:
         doc = yaml.safe_load(fh) or {}
+
+    perm_valid, perm_issues, notices = load_permanent_exceptions(doc, policy, today)
+    for ident, item in perm_valid.items():
+        valid[ident] = {**item, "_permanent": True}
+    issues.extend(perm_issues)
 
     required = policy["exceptions"]["required_fields"]
     max_days = int(policy["exceptions"]["max_days_from_now"])
@@ -237,19 +376,11 @@ def load_exceptions(
             )
             continue
 
-        expires = item["expires"]
-        if isinstance(expires, dt.datetime):
-            expires = expires.date()
-        elif isinstance(expires, str):
-            try:
-                expires = dt.date.fromisoformat(expires.strip())
-            except ValueError:
-                issues.append(
-                    ExceptionIssue("malformed_exception", ident, f"expires の日付形式が不正: {expires}")
-                )
-                continue
-        elif not isinstance(expires, dt.date):
-            issues.append(ExceptionIssue("malformed_exception", ident, "expires の型が不正"))
+        expires = _parse_date(item["expires"])
+        if expires is None:
+            issues.append(
+                ExceptionIssue("malformed_exception", ident, f"expires の日付形式が不正: {item['expires']}")
+            )
             continue
 
         if expires < today:
@@ -270,7 +401,7 @@ def load_exceptions(
 
         valid[ident] = item
 
-    return valid, issues
+    return valid, issues, notices
 
 
 def apply_exceptions(findings: list[Finding], exceptions: dict[str, dict[str, Any]]) -> None:
@@ -281,7 +412,10 @@ def apply_exceptions(findings: list[Finding], exceptions: dict[str, dict[str, An
         paths = exc.get("paths")
         if paths and not any(f.path.endswith(p) or p in f.path for p in paths):
             continue
-        f.excepted_by = f"{f.rule_id} (期限 {exc['expires']})"
+        if exc.get("_permanent"):
+            f.excepted_by = f"{f.rule_id} (恒久例外 / {exc['adr']})"
+        else:
+            f.excepted_by = f"{f.rule_id} (期限 {exc['expires']})"
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +495,31 @@ def write_summary_md(result: Result, policy: dict[str, Any], path: str, report_u
     lines.append(f"- **停止の原因: {len(blocked)} 件の検出 + {len(result.exception_issues)} 件の抑制の不備**")
     lines.append("")
 
+    permanent = [f for f in result.findings if f.excepted_by and "恒久例外" in f.excepted_by]
+    if permanent:
+        by_rule: dict[str, int] = {}
+        for f in permanent:
+            key = f.excepted_by or ""
+            by_rule[key] = by_rule.get(key, 0) + 1
+        lines.append("### 恒久例外により除外（意図した設計判断）")
+        lines.append("")
+        lines.append("| 件数 | 抑制 |")
+        lines.append("|---|---|")
+        for label, n in sorted(by_rule.items()):
+            lines.append(f"| {n} | `{label}` |")
+        lines.append("")
+
+    if result.review_notices:
+        lines.append("### 恒久例外の見直し期限超過（停止はしません）")
+        lines.append("")
+        lines.append("| ID | 根拠 | 最終レビュー | 超過日数 |")
+        lines.append("|---|---|---|---|")
+        for notice in result.review_notices:
+            lines.append(
+                f"| `{notice.exception_id}` | {notice.adr} | {notice.last_reviewed} | {notice.overdue_days} |"
+            )
+        lines.append("")
+
     if result.exception_issues:
         lines.append("### 抑制の不備（それ自体が停止条件）")
         lines.append("")
@@ -404,6 +563,7 @@ def write_summary_json(result: Result, path: str, report_url: str) -> None:
         "excepted": sum(1 for f in result.findings if f.excepted_by),
         "blocking_findings": [asdict(f) for f in result.findings if f.blocking],
         "exception_issues": [asdict(i) for i in result.exception_issues],
+        "review_notices": [asdict(n) for n in result.review_notices],
         "total_findings": len(result.findings),
         "report_url": report_url,
     }
@@ -430,14 +590,29 @@ def main(argv: list[str]) -> int:
 
     today = dt.date.today()
     findings, tools = load_sarif(args.sarif_dir, policy)
-    exceptions, exception_issues = load_exceptions(args.exceptions, policy, today)
+    exceptions, exception_issues, review_notices = load_exceptions(args.exceptions, policy, today)
     apply_exceptions(findings, exceptions)
 
-    result = Result(mode=args.mode, findings=findings, exception_issues=exception_issues, tools_seen=tools)
+    result = Result(
+        mode=args.mode,
+        findings=findings,
+        exception_issues=exception_issues,
+        review_notices=review_notices,
+        tools_seen=tools,
+    )
     judge(result, policy)
 
     write_summary_md(result, policy, args.summary_md, args.report_url)
     write_summary_json(result, args.summary_json, args.report_url)
+
+    # 恒久例外の見直し期限超過は停止させない。
+    # 警告を出し続けることで見直しを促す（ADR-0008の補足）
+    for notice in result.review_notices:
+        sys.stderr.write(
+            f"::warning::恒久例外の見直し期限を {notice.overdue_days} 日超過しています: "
+            f"{notice.exception_id}（{notice.adr} / 最終レビュー {notice.last_reviewed}）。"
+            "まだ有効な判断かを確認し、last_reviewed を更新してください\n"
+        )
 
     n = blocking_count(result)
     if n:

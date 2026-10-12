@@ -163,6 +163,53 @@ def main() -> int:
         check("検出自体は記録される", summary["total_findings"] > 0, str(summary["total_findings"]))
 
         # -------------------------------------------------------------------
+        print("恒久例外: 意図した設計判断を期限なしで表現できる（ADR-0008の補足）")
+        perm = os.path.join(FIXTURES, "permanent-exceptions.yaml")
+        code, summary = run_gate(reports, tmp, "stage", perm)
+        blocking = {f["rule_id"] for f in summary["blocking_findings"]}
+        issues = {i["exception_id"]: i["detail"] for i in summary["exception_issues"]}
+        notices = {n["exception_id"]: n for n in summary["review_notices"]}
+
+        check(
+            "有効な恒久例外は検出を除外する（期限なしでも機能する）",
+            "CVE-2025-44444" not in blocking,
+        )
+        check(
+            "**adrがない恒久例外は停止条件**（根拠のない例外を作れない）",
+            "CVE-2025-33333" in issues,
+            "恒久例外が「都合の悪い検出の捨て場」になるのを防ぐ",
+        )
+        check(
+            "adrの形式が不正な恒久例外は停止条件",
+            "java.lang.best-practice.unused-variable" in issues,
+        )
+        check(
+            "見直し周期が上限を超える恒久例外は停止条件",
+            "SECRET-dummy" in issues,
+            "実質的な恒久化を周期の上限で防ぐ",
+        )
+        check(
+            "**見直し期限の超過は停止させない**（警告のみ）",
+            "CVE-2025-22222" not in blocking and "CVE-2025-22222" in notices,
+            "恒久的な判断が期限切れで突然CIを止めるのを避ける",
+        )
+        check(
+            "超過日数が計算される",
+            notices.get("CVE-2025-22222", {}).get("overdue_days", 0) > 0,
+            str(notices.get("CVE-2025-22222")),
+        )
+        check(
+            "恒久例外で抑制していない検出は通常どおり停止する",
+            blocking == {"java.lang.security.audit.sqli.jdbc-sqli", "CVE-2025-11111"},
+            f"blocking={sorted(blocking)}",
+        )
+        check(
+            "記載不備は3件とも停止条件として数えられる",
+            len(issues) == 3,
+            f"issues={sorted(issues)}",
+        )
+
+        # -------------------------------------------------------------------
         print("壊れたSARIFを「問題なし」として通さない")
         broken_dir = os.path.join(tmp, "broken")
         os.makedirs(broken_dir, exist_ok=True)
