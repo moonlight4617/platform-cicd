@@ -176,9 +176,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # 承認記録専用のロールを使う。デプロイ権限を持たない（FR-25）。
+      # ここでstageロールを使うと、承認記録のためにstageへのデプロイ権限を
+      # 与えることになり最小権限に反する
       - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
         with:
-          role-arn: ${{ secrets.AWS_ROLE_ARN_STAGE }}
+          role-arn: ${{ secrets.AWS_ROLE_ARN_APPROVAL }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: 承認の記録

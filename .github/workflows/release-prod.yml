@@ -196,7 +196,7 @@ jobs:
           python-version: "3.12"
       - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
         with:
-          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          role-arn: ${{ secrets.AWS_ROLE_ARN_APPROVAL }}
           aws-region: ${{ secrets.AWS_REGION }}
       - uses: moonlight4617/platform-cicd/actions/record-approval@v1
         with:
@@ -240,7 +240,7 @@ jobs:
           python-version: "3.12"
       - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
         with:
-          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          role-arn: ${{ secrets.AWS_ROLE_ARN_APPROVAL }}
           aws-region: ${{ secrets.AWS_REGION }}
       - uses: moonlight4617/platform-cicd/actions/record-approval@v1
         with:
@@ -284,7 +284,7 @@ jobs:
           python-version: "3.12"
       - uses: moonlight4617/platform-cicd/actions/aws-auth@v1
         with:
-          role-arn: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          role-arn: ${{ secrets.AWS_ROLE_ARN_APPROVAL }}
           aws-region: ${{ secrets.AWS_REGION }}
       - uses: moonlight4617/platform-cicd/actions/record-approval@v1
         with:
