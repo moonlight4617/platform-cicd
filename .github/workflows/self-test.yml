@@ -38,6 +38,10 @@ jobs:
       - name: リリース記録と事前チェックのテスト
         run: python3 tests/test_release_store.py
 
+      # 誤検知で本物のドリフトが埋もれないことを固定する（ADR-0012の補足2）
+      - name: ドリフト集計のテスト
+        run: python3 tests/test_drift_summary.py
+
       - name: Pythonスクリプトの構文チェック
         run: python3 -m compileall -q scripts tests
 

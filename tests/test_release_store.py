@@ -191,7 +191,7 @@ def main() -> int:
     check("インシデントIDを保持している", unreported[0].get("incident_id") == "INC-001")
 
     print()
-    print("対象の解決（commit SHA ↔ digest）")
+    print("対象の解決（commit SHA と digest の相互変換）")
 
     release_store.query_app = lambda service, app, **kw: records  # type: ignore[assignment]
     build = release_store.find_build_by_commit("serviceA", "appA", "a1b2c3d4e5f6")

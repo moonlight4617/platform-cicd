@@ -1,0 +1,46 @@
+# ドリフト検知で無視する属性（ADR-0012の補足）
+#
+# なぜ必要か:
+#   `terraform plan -refresh-only -detailed-exitcode` は、refresh中に
+#   stateのどの属性が変わっても終了コード2を返す。
+#   これには「読み取り専用の計算属性」や「プロバイダの既知の競合」による
+#   実質的な差分でないものが含まれる。
+#
+#   実機では stage / prod の両方で、毎回2件の誤検知が出ていた。
+#   このままでは毎晩Issueが立ち続け、本物のドリフトが埋もれる。
+#   ADR-0012が「Issueが滞留し対応されない状態が常態化する」として
+#   懸念していたことが、誤検知によって確実に起きる状態だった。
+#
+# 運用方針:
+#   このファイルは platform-cicd が所有し、アプリ側では変更できない。
+#   無視する属性にはすべて理由を書く。理由のない追加はレビューで止める。
+#
+#   「ノイズだから無視する」と「実際に差分がない」は区別する。
+#   ここに載せるのは後者だけ。前者は本物のドリフトなので対応が必要。
+
+# リソース種別ごとに無視する属性
+by_resource_type:
+  aws_iam_role:
+    - attribute: managed_policy_arns
+      reason: |
+        aws_iam_role_policy_attachment を使う構成では、ロール側の
+        managed_policy_arns は Terraform の管理対象外になる。
+        refreshでは実態の値が入るため毎回差分として現れる。
+        プラットフォームの規約でアタッチはリソースとして管理するため、
+        この属性自体を見る必要がない。
+        （アプリ側でも lifecycle.ignore_changes を指定して二重に抑える）
+
+  aws_lb_target_group:
+    - attribute: load_balancer_arns
+      reason: |
+        ターゲットグループが紐づいているALBの一覧。
+        プロバイダ側で読み取り専用（Computed）であり、
+        ECSサービスがアタッチした時点で値が入る。
+        設定として指定できないため、差分として扱う意味がない。
+
+# すべてのリソース種別で無視する属性
+global:
+  - attribute: tags_all
+    reason: |
+      provider の default_tags と リソースの tags から計算される属性。
+      実際の差分は tags 側に現れるため、重複して報告する意味がない。

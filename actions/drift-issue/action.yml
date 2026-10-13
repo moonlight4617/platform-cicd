@@ -18,15 +18,20 @@ inputs:
     required: true
   env:
     required: true
-  add:
+  drift:
+    description: 対応が必要なドリフトのリソース数
     required: false
     default: "0"
-  change:
+  drift-ignored:
+    description: 差分として扱わず除外した件数
     required: false
     default: "0"
-  destroy:
+  summary-file:
+    description: >
+      planの要約（Markdown）のパス。ドリフトしている属性名の表を含む。
+      属性値は含まれない（ADR-0002）。
     required: false
-    default: "0"
+    default: ""
   report-uri:
     description: plan全文のS3 URI
     required: false
@@ -46,9 +51,9 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         NAME_PREFIX: ${{ inputs.name-prefix }}
         ENV_NAME: ${{ inputs.env }}
-        ADD: ${{ inputs.add }}
-        CHANGE: ${{ inputs.change }}
-        DESTROY: ${{ inputs.destroy }}
+        DRIFT: ${{ inputs.drift }}
+        DRIFT_IGNORED: ${{ inputs.drift-ignored }}
+        SUMMARY_FILE: ${{ inputs.summary-file }}
         REPORT_URI: ${{ inputs.report-uri }}
       run: |
         set -euo pipefail
@@ -64,11 +69,16 @@ runs:
           echo "|---|---|"
           echo "| アプリ | ${NAME_PREFIX} |"
           echo "| 環境 | ${ENV_NAME} |"
-          echo "| 追加 | ${ADD} |"
-          echo "| 変更 | ${CHANGE} |"
-          echo "| 削除 | ${DESTROY} |"
+          echo "| 乖離しているリソース | ${DRIFT} |"
+          echo "| 差分として扱わず除外 | ${DRIFT_IGNORED} |"
           echo "| 検知 | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
           echo ""
+
+          # 乖離している属性名の表（値は含まない。ADR-0002）
+          if [[ -n "${SUMMARY_FILE}" && -f "${SUMMARY_FILE}" ]]; then
+            sed -n '/### ドリフト/,/^<sub>plan全文/p' "${SUMMARY_FILE}" | sed '$d'
+            echo ""
+          fi
           echo "### 対応（いずれかを選んでください）"
           echo ""
           echo "1. **コードの状態に戻す** — Release ワークフローを実行し、承認ゲートを通してapplyする"

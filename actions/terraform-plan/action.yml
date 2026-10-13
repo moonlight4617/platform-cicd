@@ -75,6 +75,17 @@ outputs:
   destroy:
     description: 削除されるリソース数
     value: ${{ steps.plan.outputs.destroy }}
+  drift:
+    description: >
+      対応が必要なドリフトのリソース数（ADR-0012）。
+      読み取り専用の計算属性などは除外済み。
+    value: ${{ steps.plan.outputs.drift }}
+  drift-ignored:
+    description: 差分として扱わず除外したドリフトの件数
+    value: ${{ steps.plan.outputs.drift-ignored }}
+  has-drift:
+    description: 対応が必要なドリフトがあるか（true / false）
+    value: ${{ steps.plan.outputs.has-drift }}
 
 runs:
   using: composite
@@ -113,6 +124,10 @@ runs:
           -backend-config="bucket=${TFSTATE_BUCKET}" \
           -backend-config="key=${state_key}" \
           -backend-config="region=${AWS_REGION_INPUT}"
+
+    - name: PyYAMLの用意
+      shell: bash
+      run: pip install --quiet --disable-pip-version-check pyyaml
 
     - name: plan
       id: plan
@@ -171,6 +186,7 @@ runs:
           --plan-json "${GITHUB_WORKSPACE}/${REPORTS_DIR}/plan.json" \
           --env "${ENV_NAME}" \
           --out "${summary}" \
+          --drift-ignore "${GITHUB_ACTION_PATH}/../../config/drift-ignore.yaml" \
           --github-output "${GITHUB_OUTPUT}"
 
         {

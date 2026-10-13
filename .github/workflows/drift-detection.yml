@@ -158,27 +158,26 @@ jobs:
       # Slack通知のみでは流れて消え、対応の記録と担当の割り当てができない
       - name: Issueの作成または更新
         id: issue
-        if: steps.deployed.outputs.run == 'true' && steps.plan.outputs.has-changes == 'true'
+        if: steps.deployed.outputs.run == 'true' && steps.plan.outputs.has-drift == 'true'
         uses: moonlight4617/platform-cicd/actions/drift-issue@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           name-prefix: ${{ steps.app.outputs.name-prefix }}
           env: ${{ matrix.env }}
-          add: ${{ steps.plan.outputs.add }}
-          change: ${{ steps.plan.outputs.change }}
-          destroy: ${{ steps.plan.outputs.destroy }}
+          drift: ${{ steps.plan.outputs.drift }}
+          drift-ignored: ${{ steps.plan.outputs.drift-ignored }}
+          summary-file: ${{ steps.plan.outputs.summary-path }}
 
       - name: Slack通知
-        if: steps.deployed.outputs.run == 'true' && steps.plan.outputs.has-changes == 'true'
+        if: steps.deployed.outputs.run == 'true' && steps.plan.outputs.has-drift == 'true'
         uses: moonlight4617/platform-cicd/actions/notify-slack@v1
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           status: warning
           title: "ドリフト検知: ${{ steps.app.outputs.name-prefix }} / ${{ matrix.env }}"
           body: >-
-            追加 ${{ steps.plan.outputs.add }} /
-            変更 ${{ steps.plan.outputs.change }} /
-            削除 ${{ steps.plan.outputs.destroy }}。
+            ${{ steps.plan.outputs.drift }} 件のリソースで乖離を検知しました
+            （差分として扱わないもの ${{ steps.plan.outputs.drift-ignored }} 件は除外済み）。
             対応（apply / コード修正 / 無視）をIssueで判断してください。
           mention-personas: sre
           link-url: ${{ steps.issue.outputs.issue-url }}
