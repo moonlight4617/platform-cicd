@@ -5,6 +5,10 @@
 
 設計判断の背景は [docs/adr](docs/adr/) を参照。
 
+**実機検証の結果は [docs/lessons-learned.md](docs/lessons-learned.md) にまとめている。**
+設計・`terraform validate`・YAML構文チェック・ユニットテストをすべて通過したうえで、
+実行してはじめて判明した問題が17件あった。
+
 ## 目的
 
 各アプリチームごとのデプロイ精度のバラツキをなくすこと。
